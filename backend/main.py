@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,8 +9,9 @@ from dotenv import load_dotenv
 from typing import Optional
 import os
 
-from agent import run_agent_loop
+from agent import run_agent_loop, run_chat_turn
 import splunk_client
+import session_store
 
 load_dotenv(override=True)
 
@@ -56,7 +58,9 @@ async def lifespan(app: FastAPI):
         print("Snowflake connection established.")
     else:
         print("No Snowflake credentials — running in demo mode.")
+    reaper = asyncio.create_task(session_store.reaper_task())
     yield
+    reaper.cancel()
     if _conn:
         _conn.close()
 
@@ -84,7 +88,7 @@ class TokensRequest(BaseModel):
 
 class SplunkSearchRequest(BaseModel):
     store_id: int
-    token_ids: list[int] = []  # empty = store-total query (all tokens for the store)
+    token_ids: list[int] = []
     time_value: int = 30
     time_unit: str = "days"
 
@@ -96,12 +100,25 @@ class TokenItem(BaseModel):
 
 
 class AnalyzeRequest(BaseModel):
-    """The agent fetches usage itself — the client sends only the raw token list,
-    the suggested window, and whether to run against synthetic demo usage."""
     store_id: int
     tokens: list[TokenItem]
     time_window_seconds: int = 604800
     demo: bool = False
+
+
+class ChatStartRequest(BaseModel):
+    store_id: int
+    tokens: list[TokenItem]
+    demo: bool = False
+    user_message: Optional[str] = None
+
+
+class ChatReplyRequest(BaseModel):
+    answer: str
+
+
+class ChatFollowUpRequest(BaseModel):
+    message: str
 
 
 SQL = """
@@ -117,7 +134,6 @@ SQL = """
 
 
 def _demo_mode() -> bool:
-    """True when neither Snowflake nor Watchtower is available — serve synthetic data."""
     return _conn is None and splunk_client.load_watchtower_token()[0] is None
 
 
@@ -147,11 +163,9 @@ def get_tokens(req: TokensRequest) -> dict:
 
 @app.post("/api/splunk-search")
 def splunk_search(req: SplunkSearchRequest) -> dict:
-    """Raw Splunk usage for the UI table. Store-total query (all tokens for the store)."""
     window_secs = splunk_client.window_seconds(req.time_value, req.time_unit)
     splunk_url = splunk_client.build_store_total_url(req.store_id, req.time_value, req.time_unit)
 
-    # Demo mode — synthetic usage so the UI works offline.
     if _demo_mode():
         usage = splunk_client.demo_store_usage(req.store_id, window_secs)
         detail = usage["store_detail_usage"]
@@ -189,17 +203,75 @@ def splunk_search(req: SplunkSearchRequest) -> dict:
 
 @app.post("/api/analyze")
 async def analyze_tokens(req: AnalyzeRequest) -> StreamingResponse:
+    """Legacy endpoint — preserved for backward compatibility."""
     payload = {
         "store_id": req.store_id,
         "tokens": [t.model_dump() for t in req.tokens],
         "time_window_seconds": req.time_window_seconds,
-        # Agent runs on synthetic usage when the client says demo OR when there is
-        # no live Splunk access but we do have a demo profile for this store.
         "demo": req.demo or (_demo_mode() and splunk_client.has_demo_data(req.store_id)),
     }
 
     async def stream():
         async for event in run_agent_loop(payload):
+            yield event
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/chat/start")
+async def chat_start(req: ChatStartRequest) -> StreamingResponse:
+    """Chatbot entry point — creates a session and starts the agentic loop."""
+    session = session_store.create_session(req.store_id)
+
+    payload = {
+        "store_id": req.store_id,
+        "tokens": [t.model_dump() for t in req.tokens],
+        "demo": req.demo or (_demo_mode() and splunk_client.has_demo_data(req.store_id)),
+        "user_message": req.user_message or "",
+    }
+
+    async def stream():
+        async for event in run_agent_loop(payload, session=session):
+            session_store.touch_session(session["session_id"])
+            yield event
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/chat/{session_id}/reply")
+async def chat_reply(session_id: str, req: ChatReplyRequest) -> dict:
+    """Resume a paused session after HITL clarification."""
+    s = session_store.get_session(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if s["status"] != "waiting_for_clarification":
+        raise HTTPException(status_code=409, detail=f"Session not paused (status: {s['status']}).")
+    s["clarification_answer"] = req.answer
+    s["clarification_event"].set()
+    session_store.touch_session(session_id)
+    return {"ok": True}
+
+
+@app.post("/api/chat/{session_id}")
+async def chat_followup(session_id: str, req: ChatFollowUpRequest) -> StreamingResponse:
+    """Follow-up question after analysis is complete."""
+    s = session_store.get_session(session_id)
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found.")
+    if s["status"] not in ("ready", "running"):
+        raise HTTPException(status_code=409, detail=f"Session not ready (status: {s['status']}).")
+
+    async def stream():
+        async for event in run_chat_turn(s, req.message):
+            session_store.touch_session(session_id)
             yield event
 
     return StreamingResponse(

@@ -1,0 +1,14 @@
+[
+  {
+    "date": "2026-07-30",
+    "session_id": "03700822-00b4-4dfa-bc7a-d6cdd87995bc",
+    "store_summary": "## Store-Level Summary\n\nStore 1 has a single API token, **id=1108485** (**'Test Token'**). Usage was checked across both a 7-day and, after finding zero calls, an extended 45-day observation window. In both cases, the token recorded **0 calls** and **0.0% fill** across every rate-limit tier. With no",
+    "window_days": 45,
+    "token_outcomes": [
+      {
+        "token_id": 1108485,
+        "action": "token_cleanup"
+      }
+    ]
+  }
+]

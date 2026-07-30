@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, KeyboardEvent } from "react";
+import ClarificationBox from "./ClarificationBox";
 
 interface Token {
   id: number;
@@ -9,9 +10,23 @@ interface Token {
 interface AgentPanelProps {
   storeId: number;
   tokens: Token[];
-  timeWindowSeconds: number;
   demo?: boolean;
+  chatFirst?: boolean;
+  userMessage?: string;
   onClose: () => void;
+  onReanalyze?: () => void;
+}
+
+interface SplunkRow {
+  id?: number;
+  token_id?: string | number;
+  name?: string;
+  token_name?: string;
+  calls?: number;
+  cps?: number;
+  rate_429?: number;
+  fill_top?: number;
+  count_429?: number;
 }
 
 interface Step {
@@ -20,11 +35,23 @@ interface Step {
   ts: string;
   kind: "setup" | "thinking" | "tool:fetch" | "tool:skill" | "tool:score" | "tool:verify" | "tool:emit" | "error";
   tool?: string;
-  call?: string;      // concrete tool-call signature, e.g. load_skill('token_cleanup')
-  narration?: string; // agent's decision rationale, written before the tool call
+  call?: string;
+  narration?: string;
+  splunk_rows?: SplunkRow[];
+  splunk_429_rows?: SplunkRow[];
 }
 
-// The agent's one-sentence "why" written before each tool call — shown inline.
+interface ClarificationEvent {
+  question: string;
+  context?: string;
+}
+
+interface StatusCode {
+  code: number;
+  name: string;
+  description: string;
+}
+
 function DecisionNote({ text }: { text?: string }) {
   if (!text) return null;
   return (
@@ -34,7 +61,6 @@ function DecisionNote({ text }: { text?: string }) {
   );
 }
 
-// Monospace badge showing the exact tool call the agent decided to make.
 function CallChip({ call }: { call?: string }) {
   if (!call) return null;
   return (
@@ -57,7 +83,6 @@ interface TokenScore {
   recommendation: string;
   verification_approved?: boolean;
   verification_reasoning?: string;
-  // usage carried in the done event (agent fetched it mid-loop)
   splunk_count?: number | null;
   calls_per_second?: number | null;
   rate_429?: number | null;
@@ -65,12 +90,12 @@ interface TokenScore {
 }
 
 interface DoneResult {
+  session_id: string | null;
   token_scores: TokenScore[];
   store_summary: string;
   iterations: number;
   approved: boolean;
   verification_reasoning: string;
-  objections?: string[];
 }
 
 const SKILL_LABELS: Record<string, string> = {
@@ -82,26 +107,11 @@ const SKILL_LABELS: Record<string, string> = {
 };
 
 const SKILL_COLORS: Record<string, { badge: string; score: string }> = {
-  token_rotation: {
-    badge: "text-amber-700 bg-amber-50 border-amber-200",
-    score: "text-amber-700",
-  },
-  token_cleanup: {
-    badge: "text-blue-700 bg-blue-50 border-blue-200",
-    score: "text-blue-700",
-  },
-  security_audit: {
-    badge: "text-red-700 bg-red-50 border-red-200",
-    score: "text-red-700",
-  },
-  no_action: {
-    badge: "text-gray-500 bg-gray-50 border-gray-200",
-    score: "text-gray-400",
-  },
-  insufficient_data: {
-    badge: "text-orange-700 bg-orange-50 border-orange-300",
-    score: "text-orange-500",
-  },
+  token_rotation: { badge: "text-amber-700 bg-amber-50 border-amber-200", score: "text-amber-700" },
+  token_cleanup:  { badge: "text-blue-700 bg-blue-50 border-blue-200",   score: "text-blue-700"  },
+  security_audit: { badge: "text-red-700 bg-red-50 border-red-200",      score: "text-red-700"   },
+  no_action:      { badge: "text-gray-500 bg-gray-50 border-gray-200",   score: "text-gray-400"  },
+  insufficient_data: { badge: "text-orange-700 bg-orange-50 border-orange-300", score: "text-orange-500" },
 };
 
 function BoldText({ text }: { text: string }) {
@@ -134,6 +144,112 @@ function ExpandableText({ text, maxChars = 280 }: { text: string; maxChars?: num
       >
         {expanded ? "Show less" : "Read full recommendation"}
       </button>
+    </div>
+  );
+}
+
+// ── Splunk data collapsible table ──────────────────────────────────────────────
+
+function SplunkTable({ rows, is429 }: { rows: SplunkRow[]; is429?: boolean }) {
+  const [open, setOpen] = useState(false);
+  if (!rows || rows.length === 0) return null;
+  return (
+    <div className="mt-1">
+      <button
+        onClick={() => setOpen(!open)}
+        className="text-[10px] text-cyan-500 hover:text-cyan-700 font-medium flex items-center gap-0.5"
+      >
+        {open ? "▴" : "▾"} {is429 ? "429 breakdown" : "Splunk data"}
+      </button>
+      {open && (
+        <div className="mt-1 overflow-x-auto rounded border border-gray-100">
+          <table className="w-full text-[10px]">
+            <thead className="bg-gray-50">
+              <tr>
+                <th className="px-2 py-1 text-left text-gray-500 font-semibold">Token</th>
+                {is429 ? (
+                  <th className="px-2 py-1 text-right text-red-500 font-semibold">429s</th>
+                ) : (
+                  <>
+                    <th className="px-2 py-1 text-right text-gray-500 font-semibold">Calls</th>
+                    <th className="px-2 py-1 text-right text-gray-500 font-semibold">calls/s</th>
+                    <th className="px-2 py-1 text-right text-red-400 font-semibold">429</th>
+                    <th className="px-2 py-1 text-right text-amber-500 font-semibold">Fill%</th>
+                  </>
+                )}
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-50">
+              {rows.map((r, i) => {
+                const label = r.name || r.token_name || String(r.token_id || r.id || "");
+                return (
+                  <tr key={i} className="hover:bg-gray-50">
+                    <td className="px-2 py-1 text-gray-600 font-medium">{label}</td>
+                    {is429 ? (
+                      <td className="px-2 py-1 text-right font-mono text-red-600">{r.count_429 ?? 0}</td>
+                    ) : (
+                      <>
+                        <td className="px-2 py-1 text-right font-mono text-gray-500">{r.calls ?? 0}</td>
+                        <td className="px-2 py-1 text-right font-mono text-gray-500">{r.cps ?? 0}</td>
+                        <td className="px-2 py-1 text-right font-mono text-red-400">{r.rate_429 ?? 0}</td>
+                        <td className="px-2 py-1 text-right font-mono text-amber-600">{r.fill_top ?? 0}%</td>
+                      </>
+                    )}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Status codes modal ─────────────────────────────────────────────────────────
+
+function StatusCodesModal({ codes, source, onClose }: { codes: StatusCode[]; source: string; onClose: () => void }) {
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4" onClick={onClose}>
+      <div
+        className="bg-white rounded-xl shadow-xl max-w-lg w-full max-h-[80vh] flex flex-col overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="px-5 py-4 border-b border-gray-100 flex items-center justify-between shrink-0">
+          <div>
+            <h2 className="text-sm font-semibold text-gray-800">ReCharge API Status Codes</h2>
+            <a
+              href={source}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="text-xs text-violet-500 hover:text-violet-700"
+            >
+              {source}
+            </a>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 transition">
+            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+        <div className="overflow-y-auto flex-1 divide-y divide-gray-50">
+          {codes.map((c) => (
+            <div key={c.code} className="px-5 py-3">
+              <div className="flex items-center gap-2 mb-0.5">
+                <span className={`text-xs font-bold px-1.5 py-0.5 rounded font-mono ${
+                  c.code >= 500 ? "bg-red-100 text-red-700"
+                  : c.code === 429 ? "bg-amber-100 text-amber-700"
+                  : c.code >= 400 ? "bg-orange-100 text-orange-700"
+                  : "bg-green-100 text-green-700"
+                }`}>{c.code}</span>
+                <span className="text-sm font-semibold text-gray-700">{c.name}</span>
+              </div>
+              <p className="text-xs text-gray-500 leading-relaxed">{c.description}</p>
+            </div>
+          ))}
+        </div>
+      </div>
     </div>
   );
 }
@@ -171,9 +287,7 @@ function SetupStep({ step }: { step: Step }) {
       <span className="inline-block w-1.5 h-1.5 rounded-full bg-gray-300 shrink-0 mt-1.5" />
       <div className="min-w-0">
         <span className="text-[11px] text-gray-500 font-medium">{step.label}</span>
-        {step.detail && (
-          <span className="text-[10px] text-gray-400 ml-1 break-words">— {step.detail}</span>
-        )}
+        {step.detail && <span className="text-[10px] text-gray-400 ml-1 break-words">— {step.detail}</span>}
       </div>
     </div>
   );
@@ -183,13 +297,17 @@ function FetchStep({ step }: { step: Step }) {
   return (
     <div className="flex items-start gap-2 py-0.5">
       <span className="text-cyan-500 text-xs shrink-0">⤓</span>
-      <div className="min-w-0">
+      <div className="min-w-0 flex-1">
         <CallChip call={step.call} />
         <span className="text-[11px] text-cyan-600 font-medium">{step.label}</span>
-        {step.detail && (
-          <span className="text-[10px] text-gray-500 ml-1 break-words">— {step.detail}</span>
-        )}
+        {step.detail && <span className="text-[10px] text-gray-500 ml-1 break-words">— {step.detail}</span>}
         <DecisionNote text={step.narration} />
+        {step.splunk_rows && step.splunk_rows.length > 0 && (
+          <SplunkTable rows={step.splunk_rows} />
+        )}
+        {step.splunk_429_rows && step.splunk_429_rows.length > 0 && (
+          <SplunkTable rows={step.splunk_429_rows} is429 />
+        )}
       </div>
     </div>
   );
@@ -202,9 +320,7 @@ function SkillStep({ step }: { step: Step }) {
       <div className="min-w-0">
         <CallChip call={step.call} />
         <span className="text-[11px] text-indigo-600 font-medium">{step.label}</span>
-        {step.detail && (
-          <span className="text-[10px] text-gray-500 ml-1 break-words">— {step.detail}</span>
-        )}
+        {step.detail && <span className="text-[10px] text-gray-500 ml-1 break-words">— {step.detail}</span>}
         <DecisionNote text={step.narration} />
       </div>
     </div>
@@ -218,9 +334,7 @@ function ScoreStep({ step }: { step: Step }) {
       <div className="min-w-0">
         <CallChip call={step.call} />
         <span className="text-[11px] text-blue-500 font-medium">{step.label}</span>
-        {step.detail && (
-          <span className="text-[10px] text-gray-500 ml-1 break-words">— {step.detail}</span>
-        )}
+        {step.detail && <span className="text-[10px] text-gray-500 ml-1 break-words">— {step.detail}</span>}
         <DecisionNote text={step.narration} />
       </div>
     </div>
@@ -239,9 +353,7 @@ function VerifyStep({ step }: { step: Step }) {
         <span className={`text-[11px] font-medium ${approved ? "text-green-600" : "text-red-600"}`}>
           {step.label}
         </span>
-        {step.detail && (
-          <span className="text-[10px] text-gray-500 ml-1 break-words">— {step.detail}</span>
-        )}
+        {step.detail && <span className="text-[10px] text-gray-500 ml-1 break-words">— {step.detail}</span>}
         <DecisionNote text={step.narration} />
       </div>
     </div>
@@ -253,7 +365,6 @@ function EmitStep({ step }: { step: Step }) {
   const beforeArrow = arrowIdx >= 0 ? step.label.slice(0, arrowIdx).trim() : step.label;
   const actionStr = arrowIdx >= 0 ? step.label.slice(arrowIdx + 1).trim() : "";
   const colors = SKILL_COLORS[actionStr] ?? SKILL_COLORS.no_action;
-
   return (
     <div className="flex items-start gap-2 py-0.5">
       <span className="text-violet-500 text-xs shrink-0">→</span>
@@ -265,9 +376,7 @@ function EmitStep({ step }: { step: Step }) {
             {SKILL_LABELS[actionStr] ?? actionStr}
           </span>
         )}
-        {step.detail && (
-          <span className="ml-1 text-[10px] text-gray-400">— {step.detail}</span>
-        )}
+        {step.detail && <span className="ml-1 text-[10px] text-gray-400">— {step.detail}</span>}
         <DecisionNote text={step.narration} />
       </div>
     </div>
@@ -280,9 +389,7 @@ function ErrorStep({ step }: { step: Step }) {
       <span className="text-red-500 text-xs shrink-0">✗</span>
       <div className="min-w-0">
         <span className="text-[11px] text-red-600 font-medium">{step.label}</span>
-        {step.detail && (
-          <span className="text-[10px] text-red-500 ml-1">{step.detail}</span>
-        )}
+        {step.detail && <span className="text-[10px] text-red-500 ml-1">{step.detail}</span>}
       </div>
     </div>
   );
@@ -290,62 +397,31 @@ function ErrorStep({ step }: { step: Step }) {
 
 function StepRow({ step }: { step: Step }) {
   switch (step.kind) {
-    case "thinking":   return <ThinkingStep step={step} />;
-    case "tool:fetch": return <FetchStep step={step} />;
-    case "tool:skill": return <SkillStep step={step} />;
-    case "tool:score": return <ScoreStep step={step} />;
-    case "tool:verify":return <VerifyStep step={step} />;
-    case "tool:emit":  return <EmitStep step={step} />;
-    case "error":      return <ErrorStep step={step} />;
-    default:           return <SetupStep step={step} />;
+    case "thinking":    return <ThinkingStep step={step} />;
+    case "tool:fetch":  return <FetchStep step={step} />;
+    case "tool:skill":  return <SkillStep step={step} />;
+    case "tool:score":  return <ScoreStep step={step} />;
+    case "tool:verify": return <VerifyStep step={step} />;
+    case "tool:emit":   return <EmitStep step={step} />;
+    case "error":       return <ErrorStep step={step} />;
+    default:            return <SetupStep step={step} />;
   }
 }
 
-// ── Result card components ─────────────────────────────────────────────────────
-
-function VerificationBlock({ reasoning, approved }: { reasoning: string; approved: boolean }) {
-  const [expanded, setExpanded] = useState(false);
-  const maxChars = 220;
-  const short = reasoning.length > maxChars
-    ? reasoning.slice(0, maxChars).replace(/\s+\S*$/, "") + "…"
-    : reasoning;
-  const colors = approved
-    ? "bg-green-50 border-green-100 text-green-800"
-    : "bg-amber-50 border-amber-100 text-amber-800";
-
-  return (
-    <div className={`text-xs px-3 py-2.5 rounded-lg border ${colors}`}>
-      <div className="font-semibold mb-1">{approved ? "Verification passed" : "Unverified"}</div>
-      <p className="leading-relaxed">{expanded ? reasoning : short}</p>
-      {reasoning.length > maxChars && (
-        <button
-          onClick={() => setExpanded(!expanded)}
-          className="mt-1 font-medium opacity-70 hover:opacity-100"
-        >
-          {expanded ? "Show less" : "Show full reasoning"}
-        </button>
-      )}
-    </div>
-  );
-}
+// ── Result cards ──────────────────────────────────────────────────────────────
 
 function TokenScoreCard({ ts }: { ts: TokenScore }) {
   const [open, setOpen] = useState(false);
   const colors = SKILL_COLORS[ts.recommended_action] ?? SKILL_COLORS.no_action;
-  const calls = ts.splunk_count;
-  const errors429 = ts.rate_429;
-  const windowDays = ts.window_days ?? null;
-
   const scoreRows: [string, number, string, string][] = [
-    ["Token Rotation", ts.rotation_score, ts.rotation_reasoning, "token_rotation"],
-    ["Token Cleanup", ts.cleanup_score, ts.cleanup_reasoning, "token_cleanup"],
-    ["Security Audit", ts.security_audit_score, ts.security_audit_reasoning, "security_audit"],
+    ["Rotation",      ts.rotation_score,      ts.rotation_reasoning,      "token_rotation"],
+    ["Cleanup",       ts.cleanup_score,        ts.cleanup_reasoning,       "token_cleanup"],
+    ["Security",      ts.security_audit_score, ts.security_audit_reasoning,"security_audit"],
   ];
 
   return (
     <div className="border border-gray-200 rounded-lg overflow-hidden">
       <div className="px-4 py-3 bg-white">
-        {/* Header row */}
         <div className="flex items-start justify-between gap-2 flex-wrap">
           <div>
             <span className="font-mono text-gray-400 text-xs mr-2">{ts.token_id}</span>
@@ -356,7 +432,6 @@ function TokenScoreCard({ ts }: { ts: TokenScore }) {
           </span>
         </div>
 
-        {/* Mini score chips + verification */}
         <div className="flex gap-1.5 mt-2 flex-wrap">
           {scoreRows.map(([label, score, , skill]) => (
             <span
@@ -367,17 +442,17 @@ function TokenScoreCard({ ts }: { ts: TokenScore }) {
                   : "text-gray-400 bg-gray-50 border-gray-100"
               }`}
             >
-              {label.replace("Token ", "")}: {score}
+              {label}: {score}
             </span>
           ))}
-          {calls != null && (
+          {ts.splunk_count != null && (
             <span className="text-xs px-2 py-0.5 rounded-full border border-gray-100 text-gray-400 bg-gray-50">
-              {calls} calls{windowDays != null ? ` / ${windowDays}d` : ""}
+              {ts.splunk_count} calls{ts.window_days != null ? ` / ${ts.window_days}d` : ""}
             </span>
           )}
-          {errors429 != null && errors429 > 0 && (
+          {ts.rate_429 != null && ts.rate_429 > 0 && (
             <span className="text-xs px-2 py-0.5 rounded-full border border-red-200 text-red-600 bg-red-50 font-semibold">
-              {errors429} × 429
+              {ts.rate_429} × 429
             </span>
           )}
           {ts.verification_approved != null && (
@@ -391,19 +466,16 @@ function TokenScoreCard({ ts }: { ts: TokenScore }) {
           )}
         </div>
 
-        {/* Insufficient data notice */}
         {ts.recommended_action === "insufficient_data" && (
           <div className="mt-2 px-2.5 py-1.5 rounded-lg bg-orange-50 border border-orange-200 text-[11px] text-orange-800 leading-snug">
-            <span className="font-semibold">Insufficient data.</span> Retry the Splunk query with a minimum <strong>30-day</strong> window to confirm token inactivity before taking any action.
+            <span className="font-semibold">Insufficient data.</span> Retry the Splunk query with a minimum <strong>30-day</strong> window.
           </div>
         )}
 
-        {/* Recommendation */}
         <div className="mt-2.5">
           <ExpandableText text={ts.recommendation} maxChars={200} />
         </div>
 
-        {/* Toggle score details */}
         <button
           onClick={() => setOpen(!open)}
           className="mt-1.5 text-[11px] text-violet-500 hover:text-violet-700 font-medium flex items-center gap-1"
@@ -433,35 +505,94 @@ function TokenScoreCard({ ts }: { ts: TokenScore }) {
   );
 }
 
+// ── Chat message bubble ────────────────────────────────────────────────────────
+
+function ChatBubble({ role, text }: { role: "user" | "agent"; text: string }) {
+  const isUser = role === "user";
+  return (
+    <div className={`flex ${isUser ? "justify-end" : "justify-start"}`}>
+      <div className={`max-w-[90%] px-3 py-2 rounded-xl text-sm leading-relaxed ${
+        isUser
+          ? "bg-violet-600 text-white rounded-br-sm"
+          : "bg-gray-100 text-gray-800 rounded-bl-sm"
+      }`}>
+        {isUser ? text : <BoldText text={text} />}
+      </div>
+    </div>
+  );
+}
+
+// ── Streaming text display ─────────────────────────────────────────────────────
+
+function StreamingText({ text, active }: { text: string; active: boolean }) {
+  if (!text && !active) return null;
+  return (
+    <div className="px-3 py-2 bg-violet-50 rounded-xl border border-violet-100 text-sm text-gray-800 leading-relaxed">
+      <BoldText text={text} />
+      {active && <span className="inline-block w-1.5 h-3.5 ml-0.5 bg-violet-400 animate-pulse rounded-sm align-middle" />}
+    </div>
+  );
+}
+
 // ── Main panel ─────────────────────────────────────────────────────────────────
 
 export default function AgentPanel({
   storeId,
   tokens,
-  timeWindowSeconds,
   demo,
+  chatFirst,
+  userMessage,
   onClose,
+  onReanalyze,
 }: AgentPanelProps) {
   const [steps, setSteps] = useState<Step[]>([]);
   const [done, setDone] = useState<DoneResult | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [running, setRunning] = useState(true);
+  const [running, setRunning] = useState(false);
   const [expanded, setExpanded] = useState(true);
+
+  // Chat-first state
+  const [started, setStarted] = useState(!chatFirst);
+  const [initInput, setInitInput] = useState("");
+  const pendingMsgRef = useRef<string>("");
+
+  // Streaming agent reply text
+  const [streamingText, setStreamingText] = useState("");
+  const [streamingActive, setStreamingActive] = useState(false);
+
+  // HITL clarification
+  const [clarification, setClarification] = useState<ClarificationEvent | null>(null);
+  const [sessionId, setSessionId] = useState<string | null>(null);
+
+  // Follow-up chat
+  const [chatMessages, setChatMessages] = useState<Array<{ role: "user" | "agent"; text: string }>>([]);
+  const [chatInput, setChatInput] = useState("");
+  const [chatRunning, setChatRunning] = useState(false);
+  const [chatStreamText, setChatStreamText] = useState("");
+
+  // Status codes modal
+  const [statusCodes, setStatusCodes] = useState<StatusCode[] | null>(null);
+  const [statusCodesSource, setStatusCodesSource] = useState("");
+
   const bottomRef = useRef<HTMLDivElement>(null);
+  const stepsRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
+    if (!started) return;
+
     let cancelled = false;
 
     async function stream() {
+      setRunning(true);
       try {
-        const res = await fetch("/api/analyze", {
+        const res = await fetch("/api/chat/start", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             store_id: storeId,
             tokens,
-            time_window_seconds: timeWindowSeconds,
             demo: !!demo,
+            user_message: pendingMsgRef.current || userMessage || "",
           }),
         });
 
@@ -489,24 +620,37 @@ export default function AgentPanel({
             try {
               const event = JSON.parse(line.slice(6));
 
-              if (event.type === "thinking") {
-                setSteps((prev) => [
-                  ...prev,
-                  {
-                    label: "Thinking",
-                    detail: event.content ?? "",
-                    ts: event.ts ?? "",
-                    kind: "thinking",
-                  },
-                ]);
+              if (event.type === "thought_chunk") {
+                setSteps((prev) => {
+                  const last = prev[prev.length - 1];
+                  if (last?.kind === "thinking") {
+                    const updated = [...prev];
+                    updated[updated.length - 1] = { ...last, detail: (last.detail || "") + event.delta };
+                    return updated;
+                  }
+                  return [...prev, { label: "Thinking", detail: event.delta ?? "", ts: event.ts ?? "", kind: "thinking" }];
+                });
+
+              } else if (event.type === "content_chunk") {
+                setStreamingActive(true);
+                setStreamingText((prev) => prev + (event.delta ?? ""));
+
+              } else if (event.type === "thinking") {
+                const snippet = (event.content ?? "").trim();
+                if (snippet) {
+                  setSteps((prev) => [
+                    ...prev,
+                    { label: "Thinking", detail: snippet, ts: event.ts ?? "", kind: "thinking" },
+                  ]);
+                }
+
               } else if (event.type === "step") {
                 let kind: Step["kind"] = "setup";
-                if (event.tool === "fetch_token_usage") kind = "tool:fetch";
-                else if (event.tool === "load_skill") kind = "tool:skill";
+                if (event.tool === "fetch_token_usage" || event.tool === "fetch_429_errors") kind = "tool:fetch";
+                else if (event.tool === "load_skill" || event.tool === "load_recharge_status_codes") kind = "tool:skill";
                 else if (event.tool === "score_single_token") kind = "tool:score";
                 else if (event.tool === "verify_single_token_score") kind = "tool:verify";
                 else if (event.tool === "emit_recommendation") kind = "tool:emit";
-
                 setSteps((prev) => [
                   ...prev,
                   {
@@ -517,32 +661,45 @@ export default function AgentPanel({
                     tool: event.tool,
                     call: event.call,
                     narration: event.narration,
+                    splunk_rows: event.splunk_rows,
+                    splunk_429_rows: event.splunk_429_rows,
                   },
                 ]);
+
+              } else if (event.type === "status_codes") {
+                setStatusCodes(event.codes ?? []);
+                setStatusCodesSource(event.source ?? "");
+
+              } else if (event.type === "session_started") {
+                setSessionId(event.session_id ?? null);
+
+              } else if (event.type === "clarification_request") {
+                setClarification({ question: event.question, context: event.context });
+
               } else if (event.type === "done") {
                 setDone(event as DoneResult);
+                setSessionId(event.session_id ?? null);
+                setStreamingActive(false);
                 setRunning(false);
+
               } else if (event.type === "error") {
                 setSteps((prev) => [
                   ...prev,
-                  {
-                    label: "Error",
-                    detail: event.message ?? "",
-                    ts: event.ts ?? "",
-                    kind: "error",
-                  },
+                  { label: "Error", detail: event.message ?? "", ts: event.ts ?? "", kind: "error" },
                 ]);
                 setError(event.message);
+                setStreamingActive(false);
                 setRunning(false);
               }
             } catch {
-              // malformed SSE line — skip
+              // malformed SSE line
             }
           }
         }
       } catch (e: unknown) {
         if (!cancelled) {
           setError(e instanceof Error ? e.message : "Stream error");
+          setStreamingActive(false);
           setRunning(false);
         }
       }
@@ -550,122 +707,315 @@ export default function AgentPanel({
 
     stream();
     return () => { cancelled = true; };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [started]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [steps]);
+  }, [steps, streamingText, chatMessages, chatStreamText]);
 
-  // Sort token scores: highest-priority actions first
+  function startAnalysis(msg: string) {
+    pendingMsgRef.current = msg.trim();
+    setStarted(true);
+  }
+
+  function handleInitKey(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter" && !e.shiftKey && initInput.trim()) {
+      e.preventDefault();
+      startAnalysis(initInput);
+    }
+  }
+
+  async function sendChat() {
+    if (!chatInput.trim() || chatRunning || !sessionId) return;
+    const msg = chatInput.trim();
+    setChatInput("");
+    setChatMessages((prev) => [...prev, { role: "user", text: msg }]);
+    setChatRunning(true);
+    setChatStreamText("");
+
+    let cancelled = false;
+    let accumulated = "";
+
+    try {
+      const res = await fetch(`/api/chat/${sessionId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message: msg }),
+      });
+
+      if (!res.ok || !res.body) {
+        setChatMessages((prev) => [...prev, { role: "agent", text: "Error — could not reach backend." }]);
+        setChatRunning(false);
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+
+      while (!cancelled) {
+        const { done: streamDone, value } = await reader.read();
+        if (streamDone) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() ?? "";
+
+        for (const line of lines) {
+          if (!line.startsWith("data: ")) continue;
+          try {
+            const event = JSON.parse(line.slice(6));
+            if (event.type === "content_chunk") {
+              accumulated += event.delta ?? "";
+              setChatStreamText(accumulated);
+            } else if (event.type === "chat_done") {
+              setChatMessages((prev) => [...prev, { role: "agent", text: accumulated }]);
+              setChatStreamText("");
+              setChatRunning(false);
+            } else if (event.type === "error") {
+              setChatMessages((prev) => [...prev, { role: "agent", text: `Error: ${event.message}` }]);
+              setChatStreamText("");
+              setChatRunning(false);
+            }
+          } catch {
+            // skip
+          }
+        }
+      }
+    } catch {
+      if (!cancelled) {
+        setChatMessages((prev) => [...prev, { role: "agent", text: "Connection error." }]);
+        setChatStreamText("");
+        setChatRunning(false);
+      }
+    }
+  }
+
+  function handleChatKey(e: KeyboardEvent<HTMLInputElement>) {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendChat();
+    }
+  }
+
   const ACTION_ORDER: Record<string, number> = {
-    security_audit: 0,
-    token_rotation: 1,
-    token_cleanup: 2,
-    insufficient_data: 3,
-    no_action: 4,
+    security_audit: 0, token_rotation: 1, token_cleanup: 2, insufficient_data: 3, no_action: 4,
   };
   const sortedScores = done
     ? [...done.token_scores].sort(
-        (a, b) =>
-          (ACTION_ORDER[a.recommended_action] ?? 4) - (ACTION_ORDER[b.recommended_action] ?? 4)
+        (a, b) => (ACTION_ORDER[a.recommended_action] ?? 4) - (ACTION_ORDER[b.recommended_action] ?? 4)
       )
     : [];
 
   return (
-    <div className="rounded-xl border border-gray-200 shadow-sm overflow-hidden">
-      {/* Header */}
-      <div className="px-4 py-3 bg-gradient-to-r from-violet-50 to-blue-50 border-b border-gray-200 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <svg className="h-4 w-4 text-violet-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-            <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
-          </svg>
-          <span className="text-sm font-semibold text-gray-700">
-            AI Token Analyzer
-            {running && <span className="ml-2 inline-block animate-pulse text-violet-500">•</span>}
-          </span>
-        </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={() => setExpanded(!expanded)}
-            className="text-xs text-gray-400 hover:text-gray-600 font-mono transition px-1"
-            title={expanded ? "Collapse" : "Expand"}
-          >
-            {expanded ? "[−]" : "[+]"}
-          </button>
-          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 transition" title="Close">
-            <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-              <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+    <>
+      {/* Status codes modal */}
+      {statusCodes && (
+        <StatusCodesModal
+          codes={statusCodes}
+          source={statusCodesSource}
+          onClose={() => setStatusCodes(null)}
+        />
+      )}
+
+      <div className="rounded-xl border border-gray-200 shadow-sm overflow-hidden flex flex-col">
+        {/* Header */}
+        <div className="px-4 py-3 bg-gradient-to-r from-violet-50 to-blue-50 border-b border-gray-200 flex items-center justify-between shrink-0">
+          <div className="flex items-center gap-2">
+            <svg className="h-4 w-4 text-violet-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
             </svg>
-          </button>
-        </div>
-      </div>
-
-      {expanded && (
-        <>
-          {/* Analysis feed */}
-          <div className="bg-white border-b border-gray-100 p-3">
-            <div className="max-h-72 overflow-y-auto space-y-1">
-              {steps.map((step, i) => (
-                <StepRow key={i} step={step} />
-              ))}
-              {running && (
-                <div className="flex items-center gap-2 py-1 text-gray-400 text-xs">
-                  <svg className="animate-spin h-3 w-3 text-violet-400 shrink-0" fill="none" viewBox="0 0 24 24">
-                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
-                  </svg>
-                  Processing…
-                </div>
-              )}
-              <div ref={bottomRef} />
-            </div>
+            <span className="text-sm font-semibold text-gray-700">
+              AI Token Analyzer
+              {running && <span className="ml-2 inline-block animate-pulse text-violet-500">•</span>}
+            </span>
           </div>
+          <div className="flex items-center gap-2">
+            {done && onReanalyze && (
+              <button
+                onClick={onReanalyze}
+                className="text-xs text-violet-500 hover:text-violet-700 font-medium transition"
+              >
+                Re-analyze
+              </button>
+            )}
+            <button
+              onClick={() => setExpanded(!expanded)}
+              className="text-xs text-gray-400 hover:text-gray-600 font-mono transition px-1"
+              title={expanded ? "Collapse" : "Expand"}
+            >
+              {expanded ? "[−]" : "[+]"}
+            </button>
+            <button onClick={onClose} className="text-gray-400 hover:text-gray-600 transition" title="Close">
+              <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+        </div>
 
-          {/* Error block */}
-          {error && (
-            <div className="px-4 py-3 bg-red-50 border-t border-red-200 text-sm text-red-700">
-              <span className="font-semibold">Error:</span> {error}
-            </div>
-          )}
-
-          {/* Per-token result cards */}
-          {done && (
-            <div className="bg-white p-4 space-y-4">
-              <div>
-                <div className="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-2">
-                  Token Recommendations
+        {expanded && (
+          <>
+            {/* Chat-first idle state */}
+            {!started && (
+              <div className="px-4 py-6 flex flex-col gap-3 bg-white">
+                <div className="text-center">
+                  <p className="text-sm text-gray-600 font-medium">What would you like to analyze?</p>
+                  <p className="text-xs text-gray-400 mt-1">
+                    {tokens.length} token{tokens.length !== 1 ? "s" : ""} loaded for store {storeId}
+                  </p>
                 </div>
-                <div className="space-y-2">
-                  {sortedScores.map((ts) => (
-                    <TokenScoreCard key={ts.token_id} ts={ts} />
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    value={initInput}
+                    onChange={(e) => setInitInput(e.target.value)}
+                    onKeyDown={handleInitKey}
+                    placeholder="e.g. Check for rate limiting issues, or analyze all tokens…"
+                    autoFocus
+                    className="flex-1 px-3 py-2.5 text-sm border border-gray-300 rounded-lg text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-violet-400 transition"
+                  />
+                  <button
+                    onClick={() => initInput.trim() && startAnalysis(initInput)}
+                    disabled={!initInput.trim()}
+                    className="px-4 py-2.5 bg-violet-600 text-white text-xs font-semibold rounded-lg hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                  >
+                    Analyze
+                  </button>
+                </div>
+                <div className="flex flex-wrap gap-1.5 justify-center">
+                  {[
+                    "Analyze all tokens",
+                    "Check rate limiting",
+                    "Find idle tokens",
+                    "Security check",
+                  ].map((suggestion) => (
+                    <button
+                      key={suggestion}
+                      onClick={() => startAnalysis(suggestion)}
+                      className="text-[11px] px-2.5 py-1 rounded-full border border-gray-200 text-gray-500 hover:border-violet-300 hover:text-violet-600 transition"
+                    >
+                      {suggestion}
+                    </button>
                   ))}
                 </div>
               </div>
+            )}
 
-
-              {/* Store-level summary */}
-              {done.store_summary && (
-                <div className="px-3 py-3 rounded-lg bg-gray-50 border border-gray-100">
-                  <div className="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-1.5">
-                    Store Summary
-                  </div>
-                  <p className="text-sm text-gray-700 leading-relaxed">
-                    <BoldText text={done.store_summary} />
-                  </p>
+            {/* Analysis steps feed */}
+            {started && (
+              <div className="bg-white border-b border-gray-100 p-3" ref={stepsRef}>
+                <div className="max-h-64 overflow-y-auto space-y-1">
+                  {steps.map((step, i) => (
+                    <StepRow key={i} step={step} />
+                  ))}
+                  {running && (
+                    <div className="flex items-center gap-2 py-1 text-gray-400 text-xs">
+                      <svg className="animate-spin h-3 w-3 text-violet-400 shrink-0" fill="none" viewBox="0 0 24 24">
+                        <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                        <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z" />
+                      </svg>
+                      Processing…
+                    </div>
+                  )}
                 </div>
-              )}
+              </div>
+            )}
 
-              {/* Combined verification block */}
-              {done.verification_reasoning && (
-                <VerificationBlock
-                  reasoning={done.verification_reasoning}
-                  approved={done.approved}
+            {/* Streaming agent text */}
+            {started && (streamingText || streamingActive) && (
+              <div className="px-4 py-3 border-b border-gray-100">
+                <StreamingText text={streamingText} active={streamingActive} />
+              </div>
+            )}
+
+            {/* HITL clarification */}
+            {clarification && (
+              <div className="px-4 py-3 border-b border-gray-100">
+                <ClarificationBox
+                  question={clarification.question}
+                  context={clarification.context}
+                  sessionId={sessionId}
+                  onAnswered={(answer) => {
+                    setClarification(null);
+                    setChatMessages((prev) => [...prev, { role: "user", text: answer }]);
+                  }}
                 />
-              )}
-            </div>
-          )}
-        </>
-      )}
-    </div>
+              </div>
+            )}
+
+            {/* Error */}
+            {error && (
+              <div className="px-4 py-3 bg-red-50 border-t border-red-200 text-sm text-red-700">
+                <span className="font-semibold">Error:</span> {error}
+              </div>
+            )}
+
+            {/* Results */}
+            {done && (
+              <div className="bg-white p-4 space-y-4">
+                <div>
+                  <div className="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-2">
+                    Token Recommendations
+                  </div>
+                  <div className="space-y-2">
+                    {sortedScores.map((ts) => (
+                      <TokenScoreCard key={ts.token_id} ts={ts} />
+                    ))}
+                  </div>
+                </div>
+
+                {done.store_summary && (
+                  <div className="px-3 py-3 rounded-lg bg-gray-50 border border-gray-100">
+                    <div className="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-1.5">
+                      Store Summary
+                    </div>
+                    <p className="text-sm text-gray-700 leading-relaxed">
+                      <BoldText text={done.store_summary} />
+                    </p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Follow-up chat */}
+            {done && sessionId && (
+              <div className="border-t border-gray-100 bg-white">
+                {(chatMessages.length > 0 || chatStreamText) && (
+                  <div className="px-4 pt-3 space-y-2 max-h-48 overflow-y-auto">
+                    {chatMessages.map((m, i) => (
+                      <ChatBubble key={i} role={m.role} text={m.text} />
+                    ))}
+                    {chatStreamText && (
+                      <StreamingText text={chatStreamText} active={chatRunning} />
+                    )}
+                  </div>
+                )}
+                <div className="px-4 py-3 flex gap-2 items-center">
+                  <input
+                    type="text"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    onKeyDown={handleChatKey}
+                    placeholder="Ask a follow-up question…"
+                    disabled={chatRunning}
+                    className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-lg text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-violet-400 disabled:opacity-50"
+                  />
+                  <button
+                    onClick={sendChat}
+                    disabled={!chatInput.trim() || chatRunning}
+                    className="px-3 py-2 bg-violet-600 text-white text-xs font-semibold rounded-lg hover:bg-violet-700 disabled:opacity-40 disabled:cursor-not-allowed transition"
+                  >
+                    {chatRunning ? "…" : "Send"}
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div ref={bottomRef} />
+          </>
+        )}
+      </div>
+    </>
   );
 }

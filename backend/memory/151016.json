@@ -1,0 +1,74 @@
+[
+  {
+    "date": "2026-07-30",
+    "session_id": "0d08fd9d-045c-4fec-b239-5bb793df551c",
+    "store_summary": "## Store 151016 \u2014 Summary\n\nAll 7 tokens were checked over a 30-day Splunk observation window after an initial 7-day check showed no activity for any of them. Every single token \u2014 **1130125** (**'leif-T4-2021-01-capture'**), **1130124** (**'leif-T3-payments-only'**), **1045540** (**'leif-T2-orders-pm",
+    "window_days": 30,
+    "token_outcomes": [
+      {
+        "token_id": 1130125,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 1130124,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 1045540,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 976143,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 863365,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 505597,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 505598,
+        "action": "token_cleanup"
+      }
+    ]
+  },
+  {
+    "date": "2026-07-30",
+    "session_id": "3f0f3062-acce-441b-8623-d0ba24facbc1",
+    "store_summary": "## Store-Level Summary \u2014 Store 151016\n\nAll **7 tokens** for this store were analyzed over an initial 7-day window, then confirmed with a full 30-day window after the initial pull showed zero activity across the board.\n\n**Finding:** Every single token \u2014 **'leif-T4-2021-01-capture'** (**id=1130125**),",
+    "window_days": 30,
+    "token_outcomes": [
+      {
+        "token_id": 1130125,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 1130124,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 1045540,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 976143,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 863365,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 505597,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 505598,
+        "action": "token_cleanup"
+      }
+    ]
+  }
+]

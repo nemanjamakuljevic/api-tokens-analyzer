@@ -1,0 +1,34 @@
+[
+  {
+    "date": "2026-07-30",
+    "session_id": "2ac47d5d-8765-4d9d-929f-9bc3f068e318",
+    "store_summary": "## Store 20116 \u2014 Summary\n\nAcross the 3 known API tokens in this store, none showed any meaningful traffic in Splunk:\n\n- **id=1162818** (**'REVIEWS.io'**) \u2014 **insufficient_data**. Zero calls, but this token was only just created (age 0 days), so the 30-day query window doesn't reflect a real observat",
+    "window_days": 30,
+    "token_outcomes": [
+      {
+        "token_id": 1162818,
+        "action": "insufficient_data"
+      },
+      {
+        "token_id": 831360,
+        "action": "token_cleanup"
+      },
+      {
+        "token_id": 713518,
+        "action": "token_cleanup"
+      }
+    ]
+  },
+  {
+    "date": "2026-07-30",
+    "session_id": "9030fc3d-1437-4d90-b934-5c63c9438a51",
+    "store_summary": "## Store 20116 \u2014 Summary\n\nThe single tracked token for this store, **id=831360** (**'Richpanel'**, age 756 days), was analyzed with a 1-day baseline followed by a user-confirmed 30-day window to verify long-term idleness. Across the full 30-day window it recorded **zero calls** and **0.0% fill** on ",
+    "window_days": 30,
+    "token_outcomes": [
+      {
+        "token_id": 831360,
+        "action": "token_cleanup"
+      }
+    ]
+  }
+]
