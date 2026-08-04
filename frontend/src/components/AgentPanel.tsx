@@ -12,6 +12,8 @@ interface AgentPanelProps {
   tokens: Token[];
   chatFirst?: boolean;
   userMessage?: string;
+  freeForm?: boolean;
+  freeFormMessage?: string;
   onClose: () => void;
   onReanalyze?: () => void;
 }
@@ -32,7 +34,7 @@ interface Step {
   label: string;
   detail: string;
   ts: string;
-  kind: "setup" | "thinking" | "tool:fetch" | "tool:skill" | "tool:score" | "tool:verify" | "tool:emit" | "loop:rejection" | "error";
+  kind: "setup" | "thinking" | "intent" | "tool:fetch" | "tool:skill" | "tool:score" | "tool:verify" | "tool:emit" | "loop:rejection" | "error";
   tool?: string;
   call?: string;
   narration?: string;
@@ -42,6 +44,10 @@ interface Step {
   prev_window_days?: number;
   loop_event?: boolean;
   rescore?: boolean;
+  // intent-specific
+  request_type?: string;
+  requires_recommendation?: boolean;
+  open_questions?: string[];
 }
 
 interface ClarificationEvent {
@@ -436,9 +442,34 @@ function ErrorStep({ step }: { step: Step }) {
   );
 }
 
+function IntentStep({ step }: { step: Step }) {
+  const label = (step.request_type ?? "").replace(/_/g, " ");
+  const hasOpenQuestions = (step.open_questions ?? []).length > 0;
+  return (
+    <div className="flex items-start gap-2 px-2 py-1.5 rounded border border-indigo-200 bg-indigo-50">
+      <span className="text-indigo-500 text-xs shrink-0 mt-0.5">◈</span>
+      <div className="min-w-0 flex-1">
+        <div className="text-[11px] text-indigo-600 font-semibold">Understood: {label}</div>
+        {hasOpenQuestions ? (
+          <p className="mt-0.5 text-[10px] text-amber-600 leading-snug">
+            Open: {(step.open_questions ?? []).join(", ")}
+          </p>
+        ) : (
+          <p className="mt-0.5 text-[10px] text-indigo-500 leading-snug">
+            {step.requires_recommendation
+              ? "Will produce recommendations."
+              : "Informational — no recommendation pipeline."}
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function StepRow({ step }: { step: Step }) {
   switch (step.kind) {
     case "thinking":       return <ThinkingStep step={step} />;
+    case "intent":         return <IntentStep step={step} />;
     case "tool:fetch":     return <FetchStep step={step} />;
     case "tool:skill":     return <SkillStep step={step} />;
     case "tool:score":     return <ScoreStep step={step} />;
@@ -583,6 +614,8 @@ export default function AgentPanel({
   tokens,
   chatFirst,
   userMessage,
+  freeForm,
+  freeFormMessage,
   onClose,
   onReanalyze,
 }: AgentPanelProps) {
@@ -593,10 +626,10 @@ export default function AgentPanel({
   const [expanded, setExpanded] = useState(true);
   const [turnCount, setTurnCount] = useState(0);
 
-  // Chat-first state
-  const [started, setStarted] = useState(!chatFirst);
+  // Chat-first state; free-form with a message starts immediately
+  const [started, setStarted] = useState(!chatFirst || (!!freeForm && !!freeFormMessage));
   const [initInput, setInitInput] = useState("");
-  const pendingMsgRef = useRef<string>("");
+  const pendingMsgRef = useRef<string>(freeFormMessage || "");
 
   // Streaming agent reply text
   const [streamingText, setStreamingText] = useState("");
@@ -627,14 +660,14 @@ export default function AgentPanel({
     async function stream() {
       setRunning(true);
       try {
-        const res = await fetch("/api/chat/start", {
+        const url = freeForm ? "/api/chat/ask" : "/api/chat/start";
+        const body = freeForm
+          ? { message: pendingMsgRef.current || userMessage || "" }
+          : { store_id: storeId, tokens, user_message: pendingMsgRef.current || userMessage || "" };
+        const res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            store_id: storeId,
-            tokens,
-            user_message: pendingMsgRef.current || userMessage || "",
-          }),
+          body: JSON.stringify(body),
         });
 
         if (!res.ok || !res.body) {
@@ -686,9 +719,23 @@ export default function AgentPanel({
                   ]);
                 }
 
+              } else if (event.type === "intent") {
+                setSteps((prev) => [
+                  ...prev,
+                  {
+                    label: event.label ?? `Understood: ${(event.request_type ?? "").replace(/_/g, " ")}`,
+                    detail: event.detail ?? "",
+                    ts: event.ts ?? "",
+                    kind: "intent",
+                    request_type: event.request_type,
+                    requires_recommendation: event.requires_recommendation,
+                    open_questions: event.open_questions ?? [],
+                  },
+                ]);
+
               } else if (event.type === "step") {
                 let kind: Step["kind"] = "setup";
-                if (event.tool === "fetch_token_usage" || event.tool === "fetch_429_errors") kind = "tool:fetch";
+                if (event.tool === "fetch_token_usage" || event.tool === "fetch_429_errors" || event.tool === "lookup_store_tokens") kind = "tool:fetch";
                 else if (event.tool === "load_skill" || event.tool === "load_recharge_status_codes") kind = "tool:skill";
                 else if (event.tool === "score_single_token") kind = "tool:score";
                 else if (event.tool === "verify_single_token_score") kind = "tool:verify";
@@ -1020,24 +1067,37 @@ export default function AgentPanel({
             {/* Results */}
             {done && (
               <div className="bg-white p-4 space-y-4">
-                <div>
-                  <div className="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-2">
-                    Token Recommendations
-                  </div>
-                  <div className="space-y-2">
-                    {sortedScores.map((ts) => (
-                      <TokenScoreCard key={ts.token_id} ts={ts} />
-                    ))}
-                  </div>
-                </div>
-
-                {done.store_summary && (
-                  <div className="px-3 py-3 rounded-lg bg-gray-50 border border-gray-100">
-                    <div className="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-1.5">
-                      Store Summary
+                {done.token_scores.length > 0 ? (
+                  <>
+                    <div>
+                      <div className="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-2">
+                        Token Recommendations
+                      </div>
+                      <div className="space-y-2">
+                        {sortedScores.map((ts) => (
+                          <TokenScoreCard key={ts.token_id} ts={ts} />
+                        ))}
+                      </div>
                     </div>
-                    <p className="text-sm text-gray-700 leading-relaxed">
-                      <BoldText text={done.store_summary} />
+
+                    {done.store_summary && (
+                      <div className="px-3 py-3 rounded-lg bg-gray-50 border border-gray-100">
+                        <div className="text-[10px] uppercase tracking-widest text-gray-400 font-semibold mb-1.5">
+                          Store Summary
+                        </div>
+                        <p className="text-sm text-gray-700 leading-relaxed">
+                          <BoldText text={done.store_summary} />
+                        </p>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <div className="px-3 py-3 rounded-lg bg-violet-50 border border-violet-100">
+                    <div className="text-[10px] uppercase tracking-widest text-violet-400 font-semibold mb-1.5">
+                      Analysis Complete
+                    </div>
+                    <p className="text-sm text-gray-800 leading-relaxed whitespace-pre-wrap">
+                      <BoldText text={done.store_summary || "Analysis complete."} />
                     </p>
                   </div>
                 )}

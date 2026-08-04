@@ -182,11 +182,13 @@ EMIT_RECOMMENDATION_TOOL = {
 CLARIFY_WITH_USER_TOOL = {
     "name": "clarify_with_user",
     "description": (
-        "Pause the analysis and ask the user a clarifying question. Use when the data "
-        "is genuinely ambiguous and the user's context would change your recommendation "
-        "(e.g. 'Is this migration still in progress?', 'Are these duplicate tokens "
-        "intentional?', 'What timeframe should I focus on?'). "
-        "Do not ask questions you can answer from the data alone."
+        "Pause the analysis and ask the user a clarifying question. Use ONLY when the "
+        "answer would change which tool gets called next or which recommendation gets made. "
+        "Hard blockers that always require clarification: no store_id anywhere in the "
+        "request or prior context; a named token ID that does not exist for the store; "
+        "two same-named tokens where migration status changes urgency. "
+        "Do NOT ask about: vague timeframes (default to 7 days and disclose); the meaning "
+        "of 'unused' (token_cleanup.md already defines this); anything answerable from data alone."
     ),
     "input_schema": {
         "type": "object",
@@ -195,6 +197,71 @@ CLARIFY_WITH_USER_TOOL = {
             "context":  {"type": "string", "description": "Why you need this information."},
         },
         "required": ["question"],
+    },
+}
+
+RECORD_INTENT_TOOL = {
+    "name": "record_intent",
+    "description": (
+        "Record your understanding of the user's request before investigating. "
+        "Call this FIRST, before any data-fetching tool, so the analysis has a clear target. "
+        "If store_id is absent and no token IDs were mentioned, add 'no store_id given' to "
+        "open_questions — the very next step should be clarify_with_user."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "request_type": {
+                "type": "string",
+                "enum": [
+                    "full_audit", "single_token_diagnosis", "rate_limit_investigation",
+                    "cleanup_request", "security_concern", "general_question",
+                ],
+            },
+            "store_id": {
+                "type": ["integer", "null"],
+                "description": "Extracted from the request, if present.",
+            },
+            "token_ids_mentioned": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Any specific token IDs the user named.",
+            },
+            "timeframe_hint": {
+                "type": "string",
+                "description": "Any timeframe language in the request, e.g. 'yesterday'. Empty if none.",
+            },
+            "requires_recommendation": {
+                "type": "boolean",
+                "description": (
+                    "True if the user wants an actionable recommendation (rotate/cleanup/audit). "
+                    "False if this is an informational question or diagnosis."
+                ),
+            },
+            "open_questions": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Anything genuinely blocking — e.g. no store_id given, ambiguous scope.",
+            },
+        },
+        "required": ["request_type", "requires_recommendation"],
+    },
+}
+
+LOOKUP_STORE_TOKENS_TOOL = {
+    "name": "lookup_store_tokens",
+    "description": (
+        "Fetch the token roster (id, name, created_at) for a store from Snowflake. "
+        "Call when you need to know what tokens exist for a store — e.g. for a full audit, "
+        "or to check if a token has same-name siblings. "
+        "Not needed if the user already named specific token IDs and you only need their usage."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "store_id": {"type": "integer"},
+        },
+        "required": ["store_id"],
     },
 }
 
@@ -241,6 +308,8 @@ LOAD_RECHARGE_STATUS_CODES_TOOL = {
 }
 
 TOOLS = [
+    RECORD_INTENT_TOOL,
+    LOOKUP_STORE_TOKENS_TOOL,
     FETCH_TOKEN_USAGE_TOOL,
     FETCH_429_ERRORS_TOOL,
     LOAD_SKILL_TOOL,
@@ -562,6 +631,24 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
         for rec in enriched["tokens"]:
             ctx["token_records"][rec["id"]] = rec
         ctx["orphaned"] = enriched.get("orphaned_tokens", [])
+        # In free-form mode without a roster, treat Splunk-only tokens as real records
+        # so score/verify/emit tools can find them by token_id.
+        if not ctx["tokens"]:
+            for orec in ctx["orphaned"]:
+                tid = orec["id"]
+                if tid not in ctx["token_records"]:
+                    ctx["token_records"][int(tid)] = {
+                        "id": int(tid),
+                        "name": f"id={tid}",
+                        "splunk_count": orec.get("count", 0),
+                        "calls_per_second": orec.get("calls_per_second", 0),
+                        "fill_pct": {
+                            tier: round(orec.get("calls_per_second", 0) / info["leak_rate"] * 100, 1)
+                            for tier, info in RATE_TIERS.items()
+                        },
+                        "rate_429": 0,
+                        "detail": [],
+                    }
         summary = _usage_summary(enriched)
         splunk_rows = [
             {
@@ -778,6 +865,110 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
              "detail": f"{done_count}/{total} done"},
         )
 
+    if name == "record_intent":
+        ctx["intent"] = inp
+        # Propagate store_id into ctx if the model extracted one and we don't have one yet
+        extracted_sid = inp.get("store_id")
+        if extracted_sid and not ctx.get("store_id"):
+            ctx["store_id"] = extracted_sid
+
+        request_type   = inp.get("request_type", "general_question")
+        requires_rec   = inp.get("requires_recommendation", False)
+        open_questions = inp.get("open_questions") or []
+        token_ids      = inp.get("token_ids_mentioned") or []
+        timeframe      = inp.get("timeframe_hint", "")
+
+        label_parts = [f"Understood: {request_type.replace('_', ' ')}"]
+        if timeframe:
+            label_parts.append(f"timeframe: {timeframe}")
+        label = " — ".join(label_parts)
+
+        result_parts = [f"Intent recorded: {request_type}. Requires recommendation: {requires_rec}."]
+        if open_questions:
+            qs = "; ".join(open_questions)
+            result_parts.append(f"Open questions that must be resolved before proceeding: {qs}. "
+                                 f"Call clarify_with_user now.")
+
+        return (
+            " ".join(result_parts),
+            {
+                "type": "intent",
+                "tool": name,
+                "request_type": request_type,
+                "store_id": extracted_sid,
+                "requires_recommendation": requires_rec,
+                "open_questions": open_questions,
+                "token_ids_mentioned": token_ids,
+                "timeframe_hint": timeframe,
+                "label": label,
+                "detail": f"requires_recommendation={requires_rec}",
+            },
+        )
+
+    if name == "lookup_store_tokens":
+        conn = ctx.get("conn")
+        if conn is None:
+            return (
+                "Snowflake connection not available — cannot look up tokens. "
+                "Ask the user to provide the token IDs directly, or check Snowflake credentials.",
+                {"type": "step", "tool": name, "label": "Roster lookup blocked — no Snowflake", "detail": ""},
+            )
+        store_id = int(inp.get("store_id", ctx.get("store_id", 0)))
+        if not store_id:
+            return (
+                "No store_id provided to lookup_store_tokens.",
+                {"type": "step", "tool": name, "label": "Roster lookup blocked — no store_id", "detail": ""},
+            )
+
+        _SQL = (
+            "SELECT API_TOKEN_ID AS id, NAME AS name, CREATED_AT "
+            "FROM API_TOKEN "
+            "WHERE STORE_ID = %s AND _FIVETRAN_DELETED = FALSE "
+            "ORDER BY CREATED_AT DESC"
+        )
+
+        def _run_query():
+            cur = conn.cursor()
+            cur.execute(_SQL, (store_id,))
+            cols = [c[0].lower() for c in cur.description]
+            rows = cur.fetchall()
+            cur.close()
+            result = [dict(zip(cols, row)) for row in rows]
+            for t in result:
+                if t.get("created_at"):
+                    t["created_at"] = str(t["created_at"])
+            return result
+
+        try:
+            tokens = await asyncio.to_thread(_run_query)
+        except Exception as e:
+            return (
+                f"Snowflake query failed: {e}",
+                {"type": "step", "tool": name, "label": "Roster lookup error", "detail": str(e)},
+            )
+
+        ctx["store_id"]      = store_id
+        ctx["tokens"]        = tokens
+        ctx["total_tokens"]  = len(tokens)
+
+        roster_lines = "\n".join(
+            f"  id={t['id']}, name=\"{t['name']}\", created_at={t['created_at']}"
+            for t in tokens
+        )
+        roster_summary = [{"id": t["id"], "name": t["name"], "created_at": t["created_at"]} for t in tokens]
+
+        return (
+            f"Store {store_id} has {len(tokens)} token(s):\n{roster_lines}",
+            {
+                "type": "step",
+                "tool": name,
+                "call": f"lookup_store_tokens(store_id={store_id})",
+                "label": f"Roster: {len(tokens)} token(s) for store {store_id}",
+                "detail": f"{len(tokens)} token(s) fetched from Snowflake",
+                "roster": roster_summary,
+            },
+        )
+
     return f"Unknown tool: {name}", {"type": "step", "tool": name, "label": f"Unknown tool: {name}", "detail": ""}
 
 
@@ -789,6 +980,7 @@ async def _stream_turn(
     system_prompt: str,
     tools: list,
     ctx: dict,
+    tool_choice: dict = None,
 ) -> AsyncGenerator[str, None]:
     """Stream one LLM turn. Populates ctx['_turn_*']. Yields SSE strings."""
     ctx["_turn_assistant_content"] = []
@@ -806,7 +998,7 @@ async def _stream_turn(
             thinking={"type": "adaptive", "display": "summarized"},
             system=system_prompt,
             tools=tools,
-            tool_choice={"type": "auto"},
+            tool_choice=tool_choice or {"type": "auto"},
             messages=messages,
         ) as stream:
             # Real-time streaming events
@@ -900,6 +1092,32 @@ async def _stream_turn(
 # ── Token scores builder ──────────────────────────────────────────────────────────
 
 def _build_token_scores(ctx: dict) -> list:
+    if not ctx.get("tokens"):
+        # Free-form path without a roster — build only from what was actually recommended.
+        result = []
+        for token_id, rec in ctx.get("recommendations", {}).items():
+            score = ctx["scored"].get(token_id, {})
+            ver = ctx["verified"].get(token_id, {})
+            record = ctx["token_records"].get(token_id, {})
+            result.append({
+                "token_id": token_id,
+                "token_name": rec.get("token_name", score.get("token_name", f"id={token_id}")),
+                "splunk_count": record.get("splunk_count"),
+                "calls_per_second": record.get("calls_per_second"),
+                "rate_429": record.get("rate_429"),
+                "window_days": round(ctx["window_seconds"] / 86400, 2) if ctx["window_seconds"] else None,
+                "rotation_score": score.get("rotation_score", 0),
+                "rotation_reasoning": _clean_str(score.get("rotation_reasoning", "")),
+                "cleanup_score": score.get("cleanup_score", 0),
+                "cleanup_reasoning": _clean_str(score.get("cleanup_reasoning", "")),
+                "security_audit_score": score.get("security_audit_score", 0),
+                "security_audit_reasoning": _clean_str(score.get("security_audit_reasoning", "")),
+                "recommended_action": rec.get("recommended_action", "no_action"),
+                "recommendation": rec.get("recommendation", ""),
+                "verification_approved": rec.get("verification_approved", True),
+                "verification_reasoning": rec.get("verification_reasoning", ""),
+            })
+        return result
     result = []
     for t in ctx["tokens"]:
         tid = t["id"]
@@ -965,6 +1183,7 @@ def _build_token_scores(ctx: dict) -> list:
 async def run_agent_loop(
     data: dict,
     session: Optional[dict] = None,
+    conn=None,
 ) -> AsyncGenerator[str, None]:
     from memory_store import build_memory_context, save_run
 
@@ -976,9 +1195,10 @@ async def run_agent_loop(
     client = anthropic.AsyncAnthropic(api_key=api_key)
     system_prompt = _load_text(SKILLS_DIR / "system_prompt.md")
 
-    tokens = data["tokens"]
-    store_id = data["store_id"]
+    tokens = data.get("tokens") or []
+    store_id = data.get("store_id") or 0
     user_message = data.get("user_message", "").strip()
+    free_form = bool(data.get("free_form"))
     session_id = session["session_id"] if session else None
 
     if session:
@@ -986,27 +1206,39 @@ async def run_agent_loop(
 
     yield _sse({"type": "step", "label": "System prompt loaded",
                 "detail": "Agent role and rate-limit model initialized.", "ts": _ts()})
-    yield _sse({"type": "step", "label": "Tokens received (no usage yet)",
-                "detail": f"{len(tokens)} token(s) for store {store_id}. Agent will choose the observation window.",
-                "ts": _ts()})
 
-    token_lines = "\n".join(
-        f"  id={t['id']}, name=\"{t['name']}\", created_at={t['created_at']}" for t in tokens
-    )
+    if free_form:
+        yield _sse({"type": "step", "label": "Free-form request received",
+                    "detail": "Agent will determine scope and fetch what it needs.",
+                    "ts": _ts()})
+    else:
+        yield _sse({"type": "step", "label": "Tokens received (no usage yet)",
+                    "detail": f"{len(tokens)} token(s) for store {store_id}. Agent will choose the observation window.",
+                    "ts": _ts()})
 
-    # Episodic memory from prior runs
-    memory_context = build_memory_context(store_id)
+    # Episodic memory from prior runs (skip for free-form with no store yet)
+    memory_context = build_memory_context(store_id) if store_id else ""
     memory_block = f"{memory_context}\n\n" if memory_context else ""
 
-    # Objective-driven prompt — no prescriptive steps, model decides everything
-    goal_line = f'User goal: "{user_message}"\n\n' if user_message else ""
-    initial_prompt = (
-        f"{memory_block}"
-        f"{goal_line}"
-        f"Store {store_id} — {len(tokens)} API token(s). "
-        f"Your objective: ensure every token has a correct, judge-approved recommendation.\n\n"
-        f"Tokens:\n{token_lines}\n"
-    )
+    if free_form:
+        # Free-form path: just the user's message; model calls record_intent first
+        initial_prompt = (
+            f"{memory_block}"
+            f"{user_message}\n\n"
+            f"Call record_intent first to confirm your understanding, then investigate."
+        )
+    else:
+        token_lines = "\n".join(
+            f"  id={t['id']}, name=\"{t['name']}\", created_at={t['created_at']}" for t in tokens
+        )
+        goal_line = f'User goal: "{user_message}"\n\n' if user_message else ""
+        initial_prompt = (
+            f"{memory_block}"
+            f"{goal_line}"
+            f"Store {store_id} — {len(tokens)} API token(s). "
+            f"Your objective: ensure every token has a correct, judge-approved recommendation.\n\n"
+            f"Tokens:\n{token_lines}\n"
+        )
 
     ctx: dict = {
         "client": client,
@@ -1023,6 +1255,8 @@ async def run_agent_loop(
         "recommendations": {},
         "fetch_count": 0,
         "prev_scored": set(),
+        "intent": None,
+        "conn": conn,
     }
 
     if session:
@@ -1034,7 +1268,13 @@ async def run_agent_loop(
     while turn_count < MAX_TURNS:
         turn_count += 1
 
-        async for event_str in _stream_turn(client, messages, system_prompt, TOOLS, ctx):
+        # On turn 1 of a free-form request, force record_intent so the UI always
+        # gets the intent card before any data-fetching begins.
+        turn_tool_choice = None
+        if free_form and turn_count == 1:
+            turn_tool_choice = {"type": "tool", "name": "record_intent"}
+
+        async for event_str in _stream_turn(client, messages, system_prompt, TOOLS, ctx, tool_choice=turn_tool_choice):
             yield event_str
 
         if ctx.get("_turn_error"):
@@ -1090,18 +1330,20 @@ async def run_agent_loop(
                 v.get("reasoning", "") for v in ctx["verified"].values() if v.get("reasoning")
             )[:500]
 
-            # Save episodic memory
+            # Save episodic memory (use ctx store_id in case it was set mid-loop)
+            final_store_id = ctx.get("store_id") or store_id
             token_outcomes = [
                 {"token_id": ts["token_id"], "action": ts["recommended_action"]}
                 for ts in token_scores
             ]
-            save_run(
-                store_id=store_id,
-                session_id=session_id or "no-session",
-                store_summary=final_text or "Analysis complete.",
-                token_outcomes=token_outcomes,
-                window_days=ctx["max_window_days"],
-            )
+            if final_store_id:
+                save_run(
+                    store_id=final_store_id,
+                    session_id=session_id or "no-session",
+                    store_summary=final_text or "Analysis complete.",
+                    token_outcomes=token_outcomes,
+                    window_days=ctx["max_window_days"],
+                )
 
             yield _sse({
                 "type": "done",

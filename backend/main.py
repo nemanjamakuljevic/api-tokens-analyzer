@@ -114,6 +114,10 @@ class ChatFollowUpRequest(BaseModel):
     message: str
 
 
+class ChatAskRequest(BaseModel):
+    message: str
+
+
 SQL = """
     SELECT
         API_TOKEN_ID AS id,
@@ -183,7 +187,7 @@ async def analyze_tokens(req: AnalyzeRequest) -> StreamingResponse:
     }
 
     async def stream():
-        async for event in run_agent_loop(payload):
+        async for event in run_agent_loop(payload, conn=_conn):
             yield event
 
     return StreamingResponse(
@@ -205,7 +209,30 @@ async def chat_start(req: ChatStartRequest) -> StreamingResponse:
     }
 
     async def stream():
-        async for event in run_agent_loop(payload, session=session):
+        async for event in run_agent_loop(payload, session=session, conn=_conn):
+            session_store.touch_session(session["session_id"])
+            yield event
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/chat/ask")
+async def chat_ask(req: ChatAskRequest) -> StreamingResponse:
+    """Free-form entry point — no store ID or pre-fetched tokens required."""
+    session = session_store.create_session(store_id=0)
+    payload = {
+        "store_id": 0,
+        "tokens": [],
+        "user_message": req.message,
+        "free_form": True,
+    }
+
+    async def stream():
+        async for event in run_agent_loop(payload, session=session, conn=_conn):
             session_store.touch_session(session["session_id"])
             yield event
 
