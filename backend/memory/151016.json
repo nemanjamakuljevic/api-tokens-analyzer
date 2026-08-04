@@ -70,5 +70,41 @@
         "action": "token_cleanup"
       }
     ]
+  },
+  {
+    "date": "2026-07-30",
+    "session_id": "9847add6-bb2b-4e2d-9613-8132709ab5b2",
+    "store_summary": "## Store 151016 \u2014 Rate Limiting Check Summary\n\nChecked rate-limiting exposure across all **7 tokens** using a fresh 1-day Splunk window. **No rate limiting is occurring anywhere in this store right now** \u2014 the store-wide fill percentage was 0.0\u20130.1% across every tier, and no HTTP 429s were observed ",
+    "window_days": 1,
+    "token_outcomes": [
+      {
+        "token_id": 1130125,
+        "action": "insufficient_data"
+      },
+      {
+        "token_id": 1130124,
+        "action": "insufficient_data"
+      },
+      {
+        "token_id": 1045540,
+        "action": "insufficient_data"
+      },
+      {
+        "token_id": 976143,
+        "action": "insufficient_data"
+      },
+      {
+        "token_id": 863365,
+        "action": "no_action"
+      },
+      {
+        "token_id": 505597,
+        "action": "insufficient_data"
+      },
+      {
+        "token_id": 505598,
+        "action": "no_action"
+      }
+    ]
   }
 ]

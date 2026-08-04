@@ -8,20 +8,21 @@ Recommend rotation for a specific token when it is actively handling significant
 - This token and a sibling share the same name, but this token is older yet still carries most of the traffic (incomplete migration)
 - This token is the only one for the store and carries >80% of total store traffic — rotation adds resilience
 
-## Scoring Signals for each individual token (apply all that match, cap at 100)
+## Scoring Signals
 
-| Signal | Points |
-|--------|--------|
-| This token received any HTTP 429 responses (rate limiting occurring — traffic must be redistributed) | +45 |
-| This token received > 100 HTTP 429 responses in the window (severe rate limiting) | +15 additional |
-| This token's fill_pct ≥ 50% for nonpro_1x1 (avg ≥ 1.0 calls/s) | +35 |
-| This token's fill_pct ≥ 25% for nonpro_2x1 or pro_2x2 | +30 |
-| This token's fill_pct ≥ 25% for pro_5x3 | +25 |
-| This token's fill_pct ≥ 10% for pro_10x3 | +20 |
-| This token shares a name with a newer token; this token still carries more traffic (migration stalled) | +25 |
-| This token accounts for >80% of total store calls/s and no sibling exists | +20 |
-| This token's fill_pct < 2% for nonpro_1x1 AND no 429s (nearly idle, no load pressure) | -25 |
-| No Splunk data for this token | -20 |
+Use these signals to build a rotation score (0–100). Weight each signal based on how strongly the data supports it — signals that clearly apply should weigh more than signals with borderline evidence.
+
+**High-load token:** A token consistently using a meaningful share of the store's rate limit capacity is under sustained pressure. The higher the fill %, the stronger the rotation signal — especially on the smallest (cheapest) tier, where headroom is most limited.
+
+**Stalled migration:** When two tokens share the same name but the older one still carries most of the traffic, the migration to the new token is incomplete. This is one of the clearest rotation signals — credentials should rotate, and load should shift.
+
+**Sole token:** A token that handles more than 80% of all store traffic with no sibling is a single point of failure. Rotation improves resilience even if load is moderate.
+
+**Low or zero usage:** A nearly idle token has no active integration to protect. Rotation adds no value if the credentials aren't being used.
+
+**No usage data:** Without Splunk data you cannot assess load or migration state. Score conservatively.
+
+**Note:** If this token shows `rate_429 > 0`, also load the `rate_limit_pressure` skill. That skill determines whether 429s reflect burst spikes (no action needed) or sustained over-limit usage (rotation or audit warranted) based on fill %.
 
 ## Recommendation Format
 

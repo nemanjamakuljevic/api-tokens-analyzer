@@ -34,7 +34,7 @@ import anthropic
 import splunk_client
 
 SKILLS_DIR = Path(__file__).parent / "skills"
-SKILL_NAMES = ["token_rotation", "token_cleanup", "security_audit"]
+SKILL_NAMES = ["token_rotation", "token_cleanup", "security_audit", "rate_limit_pressure"]
 MODEL = "claude-sonnet-5"
 JUDGE_MODEL = "claude-sonnet-5"
 
@@ -70,12 +70,9 @@ MAX_TURNS = 60
 FETCH_TOKEN_USAGE_TOOL = {
     "name": "fetch_token_usage",
     "description": (
-        "Pull Splunk API usage for THIS store over an observation window you choose. "
-        "You start with no usage data — call this first with a 1-day window. "
-        "Extend to ≥30 days ONLY for cleanup verification — and ONLY after calling "
-        "clarify_with_user to confirm the user wants the wider query. "
+        "Pull Splunk API usage for this store over an observation window you choose. "
         "Returns per-token call counts, avg calls/s, rate-limit fill %, HTTP 429 counts, "
-        "and endpoint breakdown."
+        "and endpoint breakdown. Choose the window based on what you are investigating."
     ),
     "input_schema": {
         "type": "object",
@@ -83,7 +80,7 @@ FETCH_TOKEN_USAGE_TOOL = {
             "window_days": {
                 "type": "integer",
                 "minimum": 1,
-                "description": "Observation window in days. Default 1 day. Extend to ≥30 only for cleanup — ask user first via clarify_with_user.",
+                "description": "Observation window in days.",
             },
             "reason": {
                 "type": "string",
@@ -98,9 +95,11 @@ LOAD_SKILL_TOOL = {
     "name": "load_skill",
     "description": (
         "Load ONE scoring framework's criteria, chosen from what the usage data shows. "
-        "token_rotation: active/rate-limited tokens or stalled migrations. "
-        "token_cleanup: tokens idle over a ≥30-day window. "
-        "security_audit: fill % over capacity, 429s, or anomalous spikes. "
+        "token_rotation: active tokens or stalled migrations (older token still carries most traffic). "
+        "token_cleanup: tokens idle over a >=30-day window. "
+        "security_audit: fill % over capacity or anomalous call-rate spikes. "
+        "rate_limit_pressure: when rate_429 > 0 for a token — uses fill % to distinguish burst spikes "
+        "(no action) from sustained over-limit usage (rotation or audit warranted). "
         "Load the skill(s) relevant to a token before scoring it — do not assume all apply."
     ),
     "input_schema": {
@@ -536,24 +535,26 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
     if name == "fetch_token_usage":
         window_days = int(inp.get("window_days", DEFAULT_WINDOW_DAYS))
         window_secs = window_days * 86400
-        if ctx["demo"]:
-            usage = splunk_client.demo_store_usage(ctx["store_id"], window_secs)
-        else:
-            try:
-                res = await asyncio.to_thread(
-                    splunk_client.fetch_store_usage, ctx["store_id"], window_days, "days"
+        ctx["fetch_count"] = ctx.get("fetch_count", 0) + 1
+        is_re_query = ctx["fetch_count"] > 1
+        prev_window_days = ctx["max_window_days"] if is_re_query else None
+        try:
+            res = await asyncio.to_thread(
+                splunk_client.fetch_store_usage, ctx["store_id"], window_days, "days"
+            )
+            if res.get("redirect"):
+                return (
+                    "Splunk authentication required — cannot fetch live usage. "
+                    "Authenticate via the Splunk tab and retry.",
+                    {"type": "step", "tool": name, "label": "Fetch blocked — Splunk auth required",
+                     "detail": res.get("splunk_url", "")},
                 )
-                if res.get("redirect"):
-                    return (
-                        "Splunk authentication required — cannot fetch live usage. "
-                        "Auth in the Splunk tab, or run in demo mode.",
-                        {"type": "step", "tool": name, "label": "Fetch blocked — Splunk auth required",
-                         "detail": res.get("splunk_url", "")},
-                    )
-                usage = {"store_detail_usage": res["store_detail_usage"]}
-            except (ValueError, Exception) as splunk_err:
-                usage = splunk_client.demo_store_usage(ctx["store_id"], window_secs)
-                ctx["demo"] = True
+            usage = {"store_detail_usage": res["store_detail_usage"]}
+        except (ValueError, Exception) as splunk_err:
+            return (
+                f"Splunk fetch failed: {splunk_err}. Cannot proceed without usage data.",
+                {"type": "step", "tool": name, "label": "Fetch error", "detail": str(splunk_err)},
+            )
 
         enriched = _enrich(ctx["store_id"], ctx["tokens"], usage["store_detail_usage"], window_secs)
         ctx["window_seconds"] = window_secs
@@ -574,13 +575,14 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
             for t in enriched["tokens"]
         ]
         return (
-            f"Fetched usage over a {window_days}-day window.\n\n{summary}\n\n"
-            f"Now decide, per token: which skill applies → load_skill → score → verify → emit.",
+            f"Fetched usage over a {window_days}-day window.\n\n{summary}",
             {"type": "step", "tool": name,
              "call": f"fetch_token_usage(window_days={window_days})",
              "label": f"Fetched usage: {window_days}-day window",
              "detail": inp.get("reason", f"{enriched['total']} tokens, {len(ctx['orphaned'])} orphaned"),
-             "splunk_rows": splunk_rows},
+             "splunk_rows": splunk_rows,
+             "re_query": is_re_query,
+             "prev_window_days": prev_window_days},
         )
 
     if name == "fetch_429_errors":
@@ -588,22 +590,21 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
         window_secs = window_days * 86400
         token_ids_filter = {str(i) for i in inp.get("token_ids", [])}
 
-        if ctx["demo"]:
-            raw = splunk_client.demo_store_usage(ctx["store_id"], window_secs)["store_detail_usage"]
-        else:
-            try:
-                res = await asyncio.to_thread(
-                    splunk_client.fetch_store_usage, ctx["store_id"], window_days, "days"
+        try:
+            res = await asyncio.to_thread(
+                splunk_client.fetch_store_usage, ctx["store_id"], window_days, "days"
+            )
+            if res.get("redirect"):
+                return (
+                    "Splunk authentication required.",
+                    {"type": "step", "tool": name, "label": "Fetch blocked — Splunk auth required", "detail": ""},
                 )
-                if res.get("redirect"):
-                    return (
-                        "Splunk authentication required.",
-                        {"type": "step", "tool": name, "label": "Fetch blocked — Splunk auth required", "detail": ""},
-                    )
-                raw = res["store_detail_usage"]
-            except Exception:
-                raw = splunk_client.demo_store_usage(ctx["store_id"], window_secs)["store_detail_usage"]
-                ctx["demo"] = True
+            raw = res["store_detail_usage"]
+        except Exception as splunk_err:
+            return (
+                f"Splunk fetch failed: {splunk_err}. Cannot retrieve 429 data.",
+                {"type": "step", "tool": name, "label": "Fetch error", "detail": str(splunk_err)},
+            )
 
         rows_429 = [r for r in raw if str(r.get("status_code", "")) == "429"]
         if token_ids_filter:
@@ -672,11 +673,6 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
         )
 
     if name == "score_single_token":
-        if not ctx["skills_loaded"]:
-            return (
-                "No skill loaded yet. Call load_skill for the framework(s) relevant to this token before scoring.",
-                {"type": "step", "tool": name, "label": "Scoring blocked — load a skill first", "detail": ""},
-            )
         if not ctx["token_records"]:
             return (
                 "No usage data yet. Call fetch_token_usage before scoring.",
@@ -688,13 +684,20 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
         splunk_count = record.get("splunk_count") or 0
 
         short_window_note = ""
+        if not ctx["skills_loaded"]:
+            short_window_note += (
+                f"\n⚠ No skill loaded yet — scores recorded, but the judge may reject them for lacking criteria backing. "
+                f"Consider loading a relevant skill and re-scoring."
+            )
         if splunk_count == 0 and 0 < window_days_float < CLEANUP_MIN_WINDOW_DAYS:
-            short_window_note = (
+            short_window_note += (
                 f"\n⚠ Token {token_id} shows 0 calls over only {window_days_float:.0f} days — "
-                f"consider re-fetching with a ≥{CLEANUP_MIN_WINDOW_DAYS}-day window to confirm idleness, "
+                f"consider re-fetching with a >={CLEANUP_MIN_WINDOW_DAYS}-day window to confirm idleness, "
                 f"or emit recommended_action='insufficient_data'."
             )
 
+        is_rescore = token_id in ctx.get("prev_scored", set())
+        ctx.setdefault("prev_scored", set()).add(token_id)
         ctx["scored"][token_id] = inp
         ctx["verified"].pop(token_id, None)
         r = inp.get("rotation_score", 0)
@@ -706,7 +709,8 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
             + short_window_note,
             {"type": "step", "tool": name, "call": f"score_single_token({token_id})",
              "label": f"Scored: {inp.get('token_name', token_id)}",
-             "detail": f"rotation={r} | cleanup={c} | audit={a}"},
+             "detail": f"rotation={r} | cleanup={c} | audit={a}",
+             "rescore": is_rescore},
         )
 
     if name == "verify_single_token_score":
@@ -734,6 +738,7 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
             "call": f"verify_single_token_score({token_id})",
             "label": f"Judge {'APPROVED' if approved else 'REJECTED'}: {token_id}",
             "detail": (verdict.get("reasoning", "") or "")[:200],
+            "loop_event": not approved,
         }
 
     if name == "emit_recommendation":
@@ -973,7 +978,6 @@ async def run_agent_loop(
 
     tokens = data["tokens"]
     store_id = data["store_id"]
-    demo = bool(data.get("demo", False))
     user_message = data.get("user_message", "").strip()
     session_id = session["session_id"] if session else None
 
@@ -1001,26 +1005,13 @@ async def run_agent_loop(
         f"{goal_line}"
         f"Store {store_id} — {len(tokens)} API token(s). "
         f"Your objective: ensure every token has a correct, judge-approved recommendation.\n\n"
-        f"Tokens:\n{token_lines}\n\n"
-        f"Available skills: token_rotation · token_cleanup · security_audit\n"
-        f"Extra tools: fetch_429_errors (deep 429 analysis), load_recharge_status_codes (API error reference)\n\n"
-        f"Hard constraints:\n"
-        f"- You have no usage data until you call fetch_token_usage. Start with 1 day. "
-        f"Before re-fetching with a ≥{CLEANUP_MIN_WINDOW_DAYS}-day window (e.g. to confirm idleness for cleanup), "
-        f"call clarify_with_user first to confirm the user wants a wider query.\n"
-        f"- A token with 0 calls and a confirmed ≥{CLEANUP_MIN_WINDOW_DAYS}-day window → token_cleanup. "
-        f"A token with 0 calls on a window < {CLEANUP_MIN_WINDOW_DAYS} days → recommended_action='insufficient_data'.\n"
-        f"- A token can only be emitted after the judge approves. If rejected, re-score and re-verify.\n"
-        f"- Use clarify_with_user if context from the user would materially change your recommendation.\n"
-        f"- Before each tool call, write one sentence stating your decision and why.\n"
-        f"- Cite fill percentages, not raw calls/s. **Bold** token IDs/names in recommendations.\n"
+        f"Tokens:\n{token_lines}\n"
     )
 
     ctx: dict = {
         "client": client,
         "store_id": store_id,
         "tokens": tokens,
-        "demo": demo,
         "total_tokens": len(tokens),
         "window_seconds": 0,
         "max_window_days": 0,
@@ -1030,6 +1021,8 @@ async def run_agent_loop(
         "scored": {},
         "verified": {},
         "recommendations": {},
+        "fetch_count": 0,
+        "prev_scored": set(),
     }
 
     if session:

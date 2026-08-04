@@ -1,6 +1,6 @@
 # Skill: Security Audit
 
-Recommend a security audit for a specific token when its usage pattern indicates rate limit pressure, capacity risk, or an anomalous call rate that warrants investigation.
+Recommend a security audit for a specific token when its usage pattern indicates sustained rate limit pressure, capacity risk, or an anomalous call rate that warrants investigation.
 
 ## When to Recommend a Security Audit for a Token
 
@@ -8,20 +8,21 @@ Recommend a security audit for a specific token when its usage pattern indicates
 - This token's call rate is so high it likely triggers rate limiting for the entire store
 - This token shows an unexpectedly large spike relative to sibling tokens — potential runaway integration
 
-## Scoring Signals for each individual token (apply all that match, cap at 100)
+## Scoring Signals
 
-| Signal | Points |
-|--------|--------|
-| This token received > 100 HTTP 429 responses in the window (confirmed severe rate limiting) | +40 |
-| This token received any HTTP 429 responses (rate limiting confirmed) | +25 |
-| This token fill_pct ≥ 100% for nonpro_1x1 (avg ≥ 2.0 calls/s) — rate limiting at baseline tier | +50 |
-| This token fill_pct ≥ 100% for nonpro_2x1 (avg ≥ 4.0 calls/s) | +40 |
-| This token fill_pct ≥ 100% for pro_5x3 (avg ≥ 10.0 calls/s) | +35 |
-| This token's calls/s is ≥ 8.0 (fill_pct ≥ 80% for pro_10x3) — approaching hard limits | +30 |
-| This token's calls/s is ≥ 5.0 (fill_pct ≥ 50% for pro_10x3) | +25 |
-| This token fill_pct ≥ 80% for nonpro_2x1 (avg ≥ 3.2 calls/s) — approaching nonpro limit | +20 |
-| This token fill_pct < 10% for nonpro_1x1 AND no 429s (no capacity pressure) | -20 |
-| No Splunk data for this token | -25 |
+Use these signals to build a security_audit score (0–100). Weight each signal based on the severity of the capacity pressure the data shows.
+
+**At or beyond sustained capacity:** A token whose average call rate equals or exceeds the store's sustained limit is in continuous rate-limiting territory — not occasional spikes, but structural over-limit usage. This is the most urgent signal and should carry the most weight. The severity increases with the fill % and is highest when the token exceeds limits even on the most generous plan tier.
+
+**Approaching capacity ceiling:** A token running at a high fraction of its sustained limit (not yet at 100% but clearly trending there) is at risk during any traffic spike. The closer to the ceiling, the stronger the audit signal.
+
+**Low or no capacity pressure:** A token well under its sustained limit shows no structural risk. Score near zero — an audit would find nothing actionable.
+
+**Anomalous spike relative to siblings:** A token that shows dramatically higher call rates than other tokens for the same store may indicate a runaway integration or unauthorized use. Treat disparity as an audit signal proportional to how extreme it is.
+
+**No Splunk data:** Without usage data, capacity risk cannot be assessed.
+
+**Note:** 429 signals are handled by the `rate_limit_pressure` skill, not here. Load that skill alongside this one when `rate_429 > 0` — it determines whether 429s indicate burst or sustained over-limit usage, and routes to security_audit when fill_pct is high.
 
 ## Recommendation Format
 

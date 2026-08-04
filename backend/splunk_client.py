@@ -3,11 +3,6 @@
 Both the HTTP endpoint (`/api/splunk-search`) and the agent's `fetch_token_usage`
 tool go through here, so usage data is fetched the SAME way whether a human clicks
 "search" or the agent decides — mid-loop — that it needs more data.
-
-In demo mode (no Watchtower token) `demo_store_usage` returns synthetic usage for
-store 20116 that is deliberately shaped to exercise every decision path:
-heavy + rate-limited (security/rotation), moderate (rotation), idle (cleanup —
-which forces the agent to re-query a ≥30-day window), and near-idle (no action).
 """
 
 import json
@@ -186,58 +181,6 @@ def extract_store_total_usage(result: dict) -> list:
         except (ValueError, TypeError):
             pass
     return [{"access_token_id": tid, "count": str(cnt)} for tid, cnt in agg.items()]
-
-
-# ── Demo synthetic usage ─────────────────────────────────────────────────────────
-#
-# Per-token endpoint profiles as *calls per second*. Counts are derived by scaling
-# against the requested window, so re-querying a longer window returns proportionally
-# larger counts (realistic) while keeping the average call rate — and thus fill % —
-# stable. Idle tokens simply have no rows in any window, which is exactly the signal
-# the cleanup skill needs (but only once the window is ≥ 30 days).
-
-# (method, full_path, status_code, calls_per_second)
-_DEMO_PROFILES = {
-    20116: {
-        1152471: [  # heavy, rate-limited → security audit / rotation
-            ("GET",  "/store/products.json",     "200", 1.90),
-            ("POST", "/store/checkouts.json",     "200", 0.25),
-            ("POST", "/store/checkouts.json",     "429", 0.00050),
-        ],
-        1152461: [  # moderate, healthy → rotation candidate (stalled migration sibling)
-            ("GET",  "/store/subscriptions.json", "200", 0.90),
-            ("PUT",  "/store/subscriptions.json", "200", 0.26),
-        ],
-        1151904: [  # near-idle → no action
-            ("GET",  "/store/orders.json",        "200", 0.00800),
-        ],
-        # 1152453 and 1152394: intentionally absent → zero usage → cleanup
-    }
-}
-
-
-def has_demo_data(store_id: int) -> bool:
-    return store_id in _DEMO_PROFILES
-
-
-def demo_store_usage(store_id: int, window_seconds: int) -> dict:
-    """Synthetic detail rows for a store over the given window (demo mode)."""
-    profiles = _DEMO_PROFILES.get(store_id, {})
-    detail = []
-    for token_id, endpoints in profiles.items():
-        for method, path, status, cps in endpoints:
-            count = round(cps * window_seconds)
-            if count <= 0:
-                continue
-            detail.append({
-                "access_token_id": str(token_id),
-                "method": method,
-                "full_path": path,
-                "status_code": status,
-                "count": str(count),
-            })
-    store_total = extract_store_total_usage({"results": detail})
-    return {"store_detail_usage": detail, "store_total_usage": store_total}
 
 
 # ── Unified fetch (live) ─────────────────────────────────────────────────────────

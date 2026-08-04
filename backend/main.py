@@ -15,17 +15,6 @@ import session_store
 
 load_dotenv(override=True)
 
-# Populated from ODS.CURATED.API_TOKEN via Snowflake MCP (store_id=20116)
-DEMO_DATA: dict[int, list[dict]] = {
-    20116: [
-        {"id": 1152471, "name": "REVIEWS.io", "created_at": "2026-07-09T01:12:51"},
-        {"id": 1152461, "name": "REVIEWS.io", "created_at": "2026-07-08T22:19:04"},
-        {"id": 1152453, "name": "REVIEWS.io", "created_at": "2026-05-10T21:27:07"},
-        {"id": 1152394, "name": "REVIEWS.io", "created_at": "2026-05-02T12:21:51"},
-        {"id": 1151904, "name": "REVIEWS.io", "created_at": "2026-07-08T02:23:20"},
-    ]
-}
-
 _conn: Optional[snowflake.connector.SnowflakeConnection] = None
 
 
@@ -53,11 +42,17 @@ def create_connection() -> snowflake.connector.SnowflakeConnection:
 async def lifespan(app: FastAPI):
     global _conn
     if credentials_configured():
-        print("Connecting to Snowflake...")
-        _conn = create_connection()
-        print("Snowflake connection established.")
+        print("Snowflake credentials found — connecting in background (browser auth may open)...")
+        async def _connect_bg():
+            global _conn
+            try:
+                _conn = await asyncio.to_thread(create_connection)
+                print("Snowflake connection established — live mode active.")
+            except Exception as e:
+                print(f"Snowflake connection failed: {e} — live token lookup unavailable.")
+        asyncio.create_task(_connect_bg())
     else:
-        print("No Snowflake credentials — running in demo mode.")
+        print("No Snowflake credentials — /api/tokens will return 503.")
     reaper = asyncio.create_task(session_store.reaper_task())
     yield
     reaper.cancel()
@@ -103,13 +98,11 @@ class AnalyzeRequest(BaseModel):
     store_id: int
     tokens: list[TokenItem]
     time_window_seconds: int = 604800
-    demo: bool = False
 
 
 class ChatStartRequest(BaseModel):
     store_id: int
     tokens: list[TokenItem]
-    demo: bool = False
     user_message: Optional[str] = None
 
 
@@ -133,15 +126,10 @@ SQL = """
 """
 
 
-def _demo_mode() -> bool:
-    return _conn is None and splunk_client.load_watchtower_token()[0] is None
-
-
 @app.post("/api/tokens")
 def get_tokens(req: TokensRequest) -> dict:
     if _conn is None:
-        tokens = DEMO_DATA.get(req.store_id, [])
-        return {"tokens": tokens, "demo": True}
+        raise HTTPException(status_code=503, detail="Snowflake not connected. Add credentials to backend/.env.")
 
     try:
         cur = _conn.cursor()
@@ -163,23 +151,7 @@ def get_tokens(req: TokensRequest) -> dict:
 
 @app.post("/api/splunk-search")
 def splunk_search(req: SplunkSearchRequest) -> dict:
-    window_secs = splunk_client.window_seconds(req.time_value, req.time_unit)
     splunk_url = splunk_client.build_store_total_url(req.store_id, req.time_value, req.time_unit)
-
-    if _demo_mode():
-        usage = splunk_client.demo_store_usage(req.store_id, window_secs)
-        detail = usage["store_detail_usage"]
-        columns = ["access_token_id", "method", "full_path", "status_code", "count"]
-        rows = [[r[c] for c in columns] for r in detail]
-        return {
-            "columns": columns if detail else [],
-            "rows": rows,
-            "splunk_url": splunk_url,
-            "total": len(detail),
-            "store_total_usage": usage["store_total_usage"],
-            "store_detail_usage": detail,
-            "demo": True,
-        }
 
     try:
         res = splunk_client.fetch_store_usage(req.store_id, req.time_value, req.time_unit)
@@ -208,7 +180,6 @@ async def analyze_tokens(req: AnalyzeRequest) -> StreamingResponse:
         "store_id": req.store_id,
         "tokens": [t.model_dump() for t in req.tokens],
         "time_window_seconds": req.time_window_seconds,
-        "demo": req.demo or (_demo_mode() and splunk_client.has_demo_data(req.store_id)),
     }
 
     async def stream():
@@ -230,7 +201,6 @@ async def chat_start(req: ChatStartRequest) -> StreamingResponse:
     payload = {
         "store_id": req.store_id,
         "tokens": [t.model_dump() for t in req.tokens],
-        "demo": req.demo or (_demo_mode() and splunk_client.has_demo_data(req.store_id)),
         "user_message": req.user_message or "",
     }
 

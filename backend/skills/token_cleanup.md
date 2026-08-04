@@ -14,17 +14,19 @@ Recommend cleanup (revocation) for a specific token when it has shown zero usage
 - Splunk data is unavailable for this token — cannot safely determine if it is truly unused
 - This token still has calls/s > 0 — revocation is unsafe
 
-## Scoring Signals for each individual token (apply all that match, cap at 100)
+## Scoring Signals
 
-| Signal | Points |
-|--------|--------|
-| This token calls/s = 0.0 AND observation window ≥ 30 days | +50 |
-| This token fill_pct < 1% for nonpro_1x1 AND window ≥ 30 days | +25 |
-| This token is zero/near-zero while a sibling with the same name has fill_pct > 5% | +20 |
-| 2+ tokens share this token's name; this token is the only one with no meaningful usage | +20 |
-| This token calls/s > 0.04 AND fill_pct > 2% (actively used, revocation unsafe) | -35 |
-| Observation window < 30 days (insufficient to confirm long-term idleness) | -40 |
-| No Splunk data for this token | -30 |
+Use these signals to build a cleanup score (0–100). Weight each signal based on how confidently the data supports revocation — safety is the priority here, so err toward lower scores when evidence is thin.
+
+**Confirmed idleness over a long window:** A token with zero calls across a full 30-day observation window has been dormant long enough to rule out infrequent-but-real usage. This is the strongest cleanup signal and should carry the most weight.
+
+**Redundant alongside an active sibling:** When a token is idle while a sibling with the same name carries meaningful traffic, the idle token is clearly the old credential from a completed migration. Its removal is safe.
+
+**Short observation window:** A window under 30 days cannot confirm long-term idleness — sporadic integrations may not fire every day. Zero calls in a short window is weak evidence. Apply a strong penalty; prefer `insufficient_data` over `token_cleanup` when the window is too short.
+
+**Actively used token:** Any token with a measurable call rate is not idle and must not be revoked. Score near zero.
+
+**No Splunk data:** Without usage data, revocation cannot be safely recommended.
 
 ## Recommendation Format
 

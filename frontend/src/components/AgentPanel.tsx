@@ -10,7 +10,6 @@ interface Token {
 interface AgentPanelProps {
   storeId: number;
   tokens: Token[];
-  demo?: boolean;
   chatFirst?: boolean;
   userMessage?: string;
   onClose: () => void;
@@ -33,12 +32,16 @@ interface Step {
   label: string;
   detail: string;
   ts: string;
-  kind: "setup" | "thinking" | "tool:fetch" | "tool:skill" | "tool:score" | "tool:verify" | "tool:emit" | "error";
+  kind: "setup" | "thinking" | "tool:fetch" | "tool:skill" | "tool:score" | "tool:verify" | "tool:emit" | "loop:rejection" | "error";
   tool?: string;
   call?: string;
   narration?: string;
   splunk_rows?: SplunkRow[];
   splunk_429_rows?: SplunkRow[];
+  re_query?: boolean;
+  prev_window_days?: number;
+  loop_event?: boolean;
+  rescore?: boolean;
 }
 
 interface ClarificationEvent {
@@ -294,6 +297,25 @@ function SetupStep({ step }: { step: Step }) {
 }
 
 function FetchStep({ step }: { step: Step }) {
+  if (step.re_query) {
+    return (
+      <div className="flex items-start gap-2 py-0.5">
+        <span className="text-amber-500 text-xs shrink-0 font-bold">⟳</span>
+        <div className="min-w-0 flex-1">
+          <CallChip call={step.call} />
+          <span className="text-[11px] text-amber-600 font-medium">{step.label}</span>
+          {step.prev_window_days != null && (
+            <span className="text-[10px] text-amber-500 ml-1">— was {step.prev_window_days}d</span>
+          )}
+          {step.detail && <span className="text-[10px] text-gray-500 ml-1 break-words">· {step.detail}</span>}
+          <DecisionNote text={step.narration} />
+          {step.splunk_rows && step.splunk_rows.length > 0 && (
+            <SplunkTable rows={step.splunk_rows} />
+          )}
+        </div>
+      </div>
+    );
+  }
   return (
     <div className="flex items-start gap-2 py-0.5">
       <span className="text-cyan-500 text-xs shrink-0">⤓</span>
@@ -330,12 +352,31 @@ function SkillStep({ step }: { step: Step }) {
 function ScoreStep({ step }: { step: Step }) {
   return (
     <div className="flex items-start gap-2 py-0.5">
-      <span className="text-blue-400 text-xs shrink-0">⚡</span>
+      <span className={`text-xs shrink-0 ${step.rescore ? "text-amber-500 font-bold" : "text-blue-400"}`}>
+        {step.rescore ? "⟳" : "⚡"}
+      </span>
       <div className="min-w-0">
         <CallChip call={step.call} />
+        {step.rescore && (
+          <span className="text-[10px] text-amber-600 font-semibold mr-1">Re-scoring:</span>
+        )}
         <span className="text-[11px] text-blue-500 font-medium">{step.label}</span>
         {step.detail && <span className="text-[10px] text-gray-500 ml-1 break-words">— {step.detail}</span>}
         <DecisionNote text={step.narration} />
+      </div>
+    </div>
+  );
+}
+
+function LoopEventStep({ step }: { step: Step }) {
+  return (
+    <div className="flex items-start gap-2 px-2 py-1.5 rounded border border-amber-300 bg-amber-50">
+      <span className="text-amber-600 text-xs font-bold shrink-0">⟳</span>
+      <div className="min-w-0">
+        <span className="text-[11px] text-amber-700 font-semibold">Judge rejected — agent re-scoring</span>
+        {step.detail && (
+          <p className="text-[10px] text-amber-600 mt-0.5 leading-snug break-words">{step.detail}</p>
+        )}
       </div>
     </div>
   );
@@ -397,14 +438,15 @@ function ErrorStep({ step }: { step: Step }) {
 
 function StepRow({ step }: { step: Step }) {
   switch (step.kind) {
-    case "thinking":    return <ThinkingStep step={step} />;
-    case "tool:fetch":  return <FetchStep step={step} />;
-    case "tool:skill":  return <SkillStep step={step} />;
-    case "tool:score":  return <ScoreStep step={step} />;
-    case "tool:verify": return <VerifyStep step={step} />;
-    case "tool:emit":   return <EmitStep step={step} />;
-    case "error":       return <ErrorStep step={step} />;
-    default:            return <SetupStep step={step} />;
+    case "thinking":       return <ThinkingStep step={step} />;
+    case "tool:fetch":     return <FetchStep step={step} />;
+    case "tool:skill":     return <SkillStep step={step} />;
+    case "tool:score":     return <ScoreStep step={step} />;
+    case "tool:verify":    return <VerifyStep step={step} />;
+    case "tool:emit":      return <EmitStep step={step} />;
+    case "loop:rejection": return <LoopEventStep step={step} />;
+    case "error":          return <ErrorStep step={step} />;
+    default:               return <SetupStep step={step} />;
   }
 }
 
@@ -539,7 +581,6 @@ function StreamingText({ text, active }: { text: string; active: boolean }) {
 export default function AgentPanel({
   storeId,
   tokens,
-  demo,
   chatFirst,
   userMessage,
   onClose,
@@ -550,6 +591,7 @@ export default function AgentPanel({
   const [error, setError] = useState<string | null>(null);
   const [running, setRunning] = useState(false);
   const [expanded, setExpanded] = useState(true);
+  const [turnCount, setTurnCount] = useState(0);
 
   // Chat-first state
   const [started, setStarted] = useState(!chatFirst);
@@ -591,7 +633,6 @@ export default function AgentPanel({
           body: JSON.stringify({
             store_id: storeId,
             tokens,
-            demo: !!demo,
             user_message: pendingMsgRef.current || userMessage || "",
           }),
         });
@@ -628,6 +669,7 @@ export default function AgentPanel({
                     updated[updated.length - 1] = { ...last, detail: (last.detail || "") + event.delta };
                     return updated;
                   }
+                  setTurnCount((n) => n + 1);
                   return [...prev, { label: "Thinking", detail: event.delta ?? "", ts: event.ts ?? "", kind: "thinking" }];
                 });
 
@@ -651,20 +693,33 @@ export default function AgentPanel({
                 else if (event.tool === "score_single_token") kind = "tool:score";
                 else if (event.tool === "verify_single_token_score") kind = "tool:verify";
                 else if (event.tool === "emit_recommendation") kind = "tool:emit";
-                setSteps((prev) => [
-                  ...prev,
-                  {
-                    label: event.label ?? "",
-                    detail: event.detail ?? "",
-                    ts: event.ts ?? "",
-                    kind,
-                    tool: event.tool,
-                    call: event.call,
-                    narration: event.narration,
-                    splunk_rows: event.splunk_rows,
-                    splunk_429_rows: event.splunk_429_rows,
-                  },
-                ]);
+                const newStep: Step = {
+                  label: event.label ?? "",
+                  detail: event.detail ?? "",
+                  ts: event.ts ?? "",
+                  kind,
+                  tool: event.tool,
+                  call: event.call,
+                  narration: event.narration,
+                  splunk_rows: event.splunk_rows,
+                  splunk_429_rows: event.splunk_429_rows,
+                  re_query: event.re_query ?? false,
+                  prev_window_days: event.prev_window_days,
+                  loop_event: event.loop_event ?? false,
+                  rescore: event.rescore ?? false,
+                };
+                setSteps((prev) => {
+                  const next = [...prev, newStep];
+                  if (event.loop_event) {
+                    next.push({
+                      label: "Judge rejected — agent re-scoring",
+                      detail: event.detail ?? "",
+                      ts: event.ts ?? "",
+                      kind: "loop:rejection",
+                    });
+                  }
+                  return next;
+                });
 
               } else if (event.type === "status_codes") {
                 setStatusCodes(event.codes ?? []);
@@ -829,6 +884,11 @@ export default function AgentPanel({
               AI Token Analyzer
               {running && <span className="ml-2 inline-block animate-pulse text-violet-500">•</span>}
             </span>
+            {running && turnCount > 0 && (
+              <span className="text-[10px] text-violet-400 font-mono bg-violet-50 px-1.5 py-0.5 rounded">
+                turn {turnCount}
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2">
             {done && onReanalyze && (
@@ -871,7 +931,7 @@ export default function AgentPanel({
                     value={initInput}
                     onChange={(e) => setInitInput(e.target.value)}
                     onKeyDown={handleInitKey}
-                    placeholder="e.g. Check for rate limiting issues, or analyze all tokens…"
+                    placeholder="e.g. Analyze token 1234567, or check REVIEWS.io for rate limiting…"
                     autoFocus
                     className="flex-1 px-3 py-2.5 text-sm border border-gray-300 rounded-lg text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-violet-400 transition"
                   />
@@ -898,6 +958,12 @@ export default function AgentPanel({
                       {suggestion}
                     </button>
                   ))}
+                  <button
+                    onClick={() => setInitInput("Focus only on token ")}
+                    className="text-[11px] px-2.5 py-1 rounded-full border border-gray-200 text-gray-500 hover:border-violet-300 hover:text-violet-600 transition"
+                  >
+                    Focus on token ID or name…
+                  </button>
                 </div>
               </div>
             )}
@@ -975,6 +1041,9 @@ export default function AgentPanel({
                     </p>
                   </div>
                 )}
+                <p className="text-[10px] text-gray-400 text-center">
+                  {done.iterations} turn{done.iterations !== 1 ? "s" : ""} · {done.approved ? "all verified" : "partial verification"}
+                </p>
               </div>
             )}
 

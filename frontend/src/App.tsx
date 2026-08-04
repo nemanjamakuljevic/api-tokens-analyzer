@@ -10,7 +10,7 @@ interface Token {
 type State =
   | { status: "idle" }
   | { status: "loading" }
-  | { status: "success"; tokens: Token[]; demo: boolean }
+  | { status: "success"; tokens: Token[] }
   | { status: "error"; message: string };
 
 export default function App() {
@@ -32,7 +32,7 @@ export default function App() {
         return;
       }
       const data = await res.json();
-      setState({ status: "success", tokens: data.tokens, demo: !!data.demo });
+      setState({ status: "success", tokens: data.tokens });
     } catch {
       setState({ status: "error", message: "Could not reach the backend. Is it running?" });
     }
@@ -86,13 +86,6 @@ export default function App() {
           <span className="font-semibold">Error:</span> {state.message}
         </div>
       )}
-      {state.status === "success" && state.demo && (
-        <div className="px-4 py-2.5 bg-amber-50 border border-amber-200 rounded-lg text-amber-700 text-xs font-medium">
-          Demo mode — showing cached data. Fill in{" "}
-          <code className="font-mono bg-amber-100 px-1 rounded">backend/.env</code> with your
-          Snowflake credentials for live queries.
-        </div>
-      )}
     </>
   );
 
@@ -109,7 +102,6 @@ export default function App() {
         <TokensTable
           tokens={state.status === "success" ? state.tokens : []}
           storeId={parseInt(storeId, 10) || 0}
-          demo={state.status === "success" ? state.demo : false}
           formSlot={formSlot}
           statusSlot={statusSlot}
         />
