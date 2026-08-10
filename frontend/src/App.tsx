@@ -1,6 +1,7 @@
 import { useState, FormEvent } from "react";
 import TokensTable from "./components/TokensTable";
 import AgentPanel from "./components/AgentPanel";
+import AuthModal from "./components/AuthModal";
 
 interface Token {
   id: number;
@@ -20,7 +21,17 @@ type FreeFormState =
   | { status: "idle" }
   | { status: "analyzing"; message: string };
 
+type AuthMode = "api_key" | "claude_cli";
+
+const AUTH_STORAGE_KEY = "api_token_analyzer_auth_mode";
+
+function loadStoredAuthMode(): AuthMode | null {
+  const v = localStorage.getItem(AUTH_STORAGE_KEY);
+  return v === "api_key" || v === "claude_cli" ? v : null;
+}
+
 export default function App() {
+  const [authMode, setAuthMode] = useState<AuthMode | null>(loadStoredAuthMode);
   const [mode, setMode] = useState<AppMode>("free_form");
 
   // Free-form state
@@ -65,14 +76,41 @@ export default function App() {
     }
   }
 
+  if (!authMode) {
+    return (
+      <AuthModal
+        onSelect={(mode) => {
+          localStorage.setItem(AUTH_STORAGE_KEY, mode);
+          setAuthMode(mode);
+        }}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50">
       <div className="max-w-[1400px] mx-auto px-4 py-10">
-        <div className="mb-6">
-          <h1 className="text-3xl font-bold text-gray-900 tracking-tight">API Token Analyzer</h1>
-          <p className="mt-1 text-gray-500 text-sm">
-            Ask anything about your API tokens — the agent decides what to fetch and how to answer.
-          </p>
+        <div className="mb-6 flex items-start justify-between gap-4">
+          <div>
+            <h1 className="text-3xl font-bold text-gray-900 tracking-tight">API Token Analyzer</h1>
+            <p className="mt-1 text-gray-500 text-sm">
+              Ask anything about your API tokens — the agent decides what to fetch and how to answer.
+            </p>
+          </div>
+          <button
+            onClick={() => {
+              localStorage.removeItem(AUTH_STORAGE_KEY);
+              setAuthMode(null);
+            }}
+            className={`mt-1 shrink-0 text-[11px] px-2.5 py-1 rounded-full border font-medium transition ${
+              authMode === "claude_cli"
+                ? "border-emerald-200 text-emerald-700 bg-emerald-50 hover:bg-emerald-100"
+                : "border-violet-200 text-violet-700 bg-violet-50 hover:bg-violet-100"
+            }`}
+            title="Click to switch authentication mode"
+          >
+            {authMode === "claude_cli" ? "Claude CLI Session" : "API Key"} ↗
+          </button>
         </div>
 
         {/* Free-form mode */}
@@ -153,6 +191,7 @@ export default function App() {
                   freeForm={true}
                   freeFormMessage={freeFormState.message}
                   chatFirst={false}
+                  authMode={authMode}
                   onClose={resetFreeForm}
                   onReanalyze={() => {
                     setFreeFormKey((k) => k + 1);
@@ -227,6 +266,7 @@ export default function App() {
                 storeId={parseInt(storeId, 10) || 0}
                 formSlot={null}
                 statusSlot={null}
+                authMode={authMode}
               />
             </div>
           </>

@@ -104,6 +104,7 @@ class ChatStartRequest(BaseModel):
     store_id: int
     tokens: list[TokenItem]
     user_message: Optional[str] = None
+    auth_mode: Optional[str] = "api_key"
 
 
 class ChatReplyRequest(BaseModel):
@@ -116,6 +117,7 @@ class ChatFollowUpRequest(BaseModel):
 
 class ChatAskRequest(BaseModel):
     message: str
+    auth_mode: Optional[str] = "api_key"
 
 
 SQL = """
@@ -200,7 +202,9 @@ async def analyze_tokens(req: AnalyzeRequest) -> StreamingResponse:
 @app.post("/api/chat/start")
 async def chat_start(req: ChatStartRequest) -> StreamingResponse:
     """Chatbot entry point — creates a session and starts the agentic loop."""
+    auth_mode = req.auth_mode or "api_key"
     session = session_store.create_session(req.store_id)
+    session["auth_mode"] = auth_mode
 
     payload = {
         "store_id": req.store_id,
@@ -209,7 +213,7 @@ async def chat_start(req: ChatStartRequest) -> StreamingResponse:
     }
 
     async def stream():
-        async for event in run_agent_loop(payload, session=session, conn=_conn):
+        async for event in run_agent_loop(payload, session=session, conn=_conn, auth_mode=auth_mode):
             session_store.touch_session(session["session_id"])
             yield event
 
@@ -223,7 +227,9 @@ async def chat_start(req: ChatStartRequest) -> StreamingResponse:
 @app.post("/api/chat/ask")
 async def chat_ask(req: ChatAskRequest) -> StreamingResponse:
     """Free-form entry point — no store ID or pre-fetched tokens required."""
+    auth_mode = req.auth_mode or "api_key"
     session = session_store.create_session(store_id=0)
+    session["auth_mode"] = auth_mode
     payload = {
         "store_id": 0,
         "tokens": [],
@@ -232,7 +238,7 @@ async def chat_ask(req: ChatAskRequest) -> StreamingResponse:
     }
 
     async def stream():
-        async for event in run_agent_loop(payload, session=session, conn=_conn):
+        async for event in run_agent_loop(payload, session=session, conn=_conn, auth_mode=auth_mode):
             session_store.touch_session(session["session_id"])
             yield event
 
@@ -266,8 +272,10 @@ async def chat_followup(session_id: str, req: ChatFollowUpRequest) -> StreamingR
     if s["status"] not in ("ready", "running"):
         raise HTTPException(status_code=409, detail=f"Session not ready (status: {s['status']}).")
 
+    session_auth_mode = s.get("auth_mode", "api_key")
+
     async def stream():
-        async for event in run_chat_turn(s, req.message):
+        async for event in run_chat_turn(s, req.message, auth_mode=session_auth_mode):
             session_store.touch_session(session_id)
             yield event
 

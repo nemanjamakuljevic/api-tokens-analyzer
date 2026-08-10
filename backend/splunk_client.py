@@ -21,35 +21,49 @@ _UNIT_SECONDS = {"minutes": 60, "hours": 3600, "days": 86400}
 
 # ── SPL builders ────────────────────────────────────────────────────────────────
 
-def build_splunk_spl(store_id: int, token_ids: list, time_value: int = 30, time_unit: str = "minutes") -> str:
-    tokens_csv = ", ".join(str(t) for t in token_ids)
+def build_spl(
+    store_id: int,
+    time_value: int = 30,
+    time_unit: str = "minutes",
+    token_ids: Optional[list] = None,
+    grouped: bool = True,
+) -> str:
+    """Unified SPL builder.
+
+    Returns raw request rows by default (method, full_path, status_code,
+    request_started_at, request_ended_at, access_token_id, request_duration).
+    When grouped=True, appends '| stats count by access_token_id' so the model
+    gets a compact per-token summary instead of individual rows.
+    """
     earliest = f"-{time_value}{_UNIT_SPL.get(time_unit, 'm')}"
-    return (
-        f'index=k8s-customcheckout-prod store_id={store_id} '
-        f'method IN ("POST","PUT","DELETE","GET") full_path="/*api/*" '
-        f'access_token_id IN ({tokens_csv}) earliest={earliest} latest=now\n'
+    token_filter = ""
+    if token_ids:
+        ids_csv = ", ".join(str(t) for t in token_ids)
+        token_filter = f" access_token_id IN ({ids_csv})"
+
+    spl = (
+        f'index=k8s-customcheckout-prod store_id={store_id}'
+        f' method IN ("POST","PUT","DELETE","GET")'
+        f' full_path="/*api/*"'
+        f'{token_filter}'
+        f' earliest={earliest} latest=now\n'
         '| eval request_started_at=(_time-\'request_duration\')\n'
         '| eval request_started_at=strftime(request_started_at, "%Y-%m-%d %H:%M:%S.%Q")\n'
         '| eval request_ended_at=strftime(_time, "%Y-%m-%d %H:%M:%S.%Q")\n'
         '| sort 0 request_started_at\n'
-        '| table method full_path status_code request_started_at request_ended_at access_token_id request_duration\n'
-        '| stats count by access_token_id'
+        '| table method full_path status_code request_started_at request_ended_at access_token_id request_duration'
     )
+    if grouped:
+        spl += '\n| stats count by access_token_id method full_path status_code'
+    return spl
 
 
 def build_store_total_spl(store_id: int, time_value: int = 30, time_unit: str = "minutes") -> str:
-    earliest = f"-{time_value}{_UNIT_SPL.get(time_unit, 'm')}"
-    return (
-        f'index=k8s-customcheckout-prod store_id={store_id} '
-        f'method IN ("POST","PUT","DELETE","GET") full_path="/*api/*" '
-        f'earliest={earliest} latest=now\n'
-        '| eval request_started_at=(_time-\'request_duration\')\n'
-        '| eval request_started_at=strftime(request_started_at, "%Y-%m-%d %H:%M:%S.%Q")\n'
-        '| eval request_ended_at=strftime(_time, "%Y-%m-%d %H:%M:%S.%Q")\n'
-        '| sort 0 request_started_at\n'
-        '| table method full_path status_code access_token_id\n'
-        '| stats count by access_token_id method full_path status_code'
-    )
+    return build_spl(store_id, time_value, time_unit)
+
+
+def build_splunk_spl(store_id: int, token_ids: list, time_value: int = 30, time_unit: str = "minutes") -> str:
+    return build_spl(store_id, time_value, time_unit, token_ids=token_ids)
 
 
 def build_store_total_url(store_id: int, time_value: int = 30, time_unit: str = "minutes") -> str:
@@ -155,18 +169,34 @@ def call_watchtower_splunk(query: str, access_token: str):
 
 
 def extract_detail_usage(result: dict) -> list:
-    """Return full detail rows (access_token_id, method, full_path, status_code, count)."""
-    return [
-        {
-            "access_token_id": str(row.get("access_token_id", "")),
+    """Return detail rows from Splunk results.
+
+    Handles both raw-row results (each row = 1 request, no 'count' field) and
+    grouped results ('| stats count by access_token_id' was appended).
+    Raw rows include request_started_at, request_ended_at, and request_duration.
+    """
+    rows = []
+    for row in result.get("results", []):
+        tid = str(row.get("access_token_id", ""))
+        if not tid:
+            continue
+        rec: dict = {
+            "access_token_id": tid,
             "method":          str(row.get("method", "")),
             "full_path":       str(row.get("full_path", "")),
             "status_code":     str(row.get("status_code", "")),
-            "count":           str(row.get("count", "0")),
         }
-        for row in result.get("results", [])
-        if row.get("access_token_id")
-    ]
+        # Grouped results have a 'count' field; raw rows each represent 1 request.
+        if "count" in row:
+            rec["count"] = str(row["count"])
+        else:
+            rec["count"] = "1"
+        # Raw-row extras — present when grouped=False
+        for extra in ("request_started_at", "request_ended_at", "request_duration"):
+            if extra in row:
+                rec[extra] = str(row[extra])
+        rows.append(rec)
+    return rows
 
 
 def extract_store_total_usage(result: dict) -> list:
@@ -185,11 +215,23 @@ def extract_store_total_usage(result: dict) -> list:
 
 # ── Unified fetch (live) ─────────────────────────────────────────────────────────
 
-def fetch_store_usage(store_id: int, time_value: int, time_unit: str) -> dict:
-    """Fetch store-total usage from Splunk (live). Returns a dict with either
-    usage rows or a `redirect` flag when Watchtower auth is required."""
-    splunk_url = build_store_total_url(store_id, time_value, time_unit)
-    query = build_store_total_spl(store_id, time_value, time_unit)
+def fetch_store_usage(
+    store_id: int,
+    time_value: int,
+    time_unit: str,
+    token_ids: Optional[list] = None,
+    grouped: bool = True,
+) -> dict:
+    """Fetch usage from Splunk (live).
+
+    token_ids: filter to specific access_token_ids (recommended when known).
+    grouped: append '| stats count by access_token_id' for compact summary.
+    Returns a dict with usage rows or a 'redirect' flag when auth is required.
+    """
+    query = build_spl(store_id, time_value, time_unit, token_ids=token_ids, grouped=grouped)
+    earliest = f"-{time_value}{_UNIT_SPL.get(time_unit, 'm')}"
+    params = urlencode({"q": "search " + query, "earliest": earliest, "latest": "now"})
+    splunk_url = f"https://rechargepayments.splunkcloud.com/en-GB/app/search/search?{params}"
 
     access_token, token_data = load_watchtower_token()
     if not access_token:

@@ -24,6 +24,8 @@ import asyncio
 import json
 import os
 import re
+import subprocess
+import uuid
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +39,46 @@ SKILLS_DIR = Path(__file__).parent / "skills"
 SKILL_NAMES = ["token_rotation", "token_cleanup", "security_audit", "rate_limit_pressure"]
 MODEL = "claude-sonnet-5"
 JUDGE_MODEL = "claude-sonnet-5"
+FAST_MODEL = "claude-haiku-4-5-20251001"   # for structured scoring/verification turns
+
+# Snowflake token TTL cache: token_id → (fetched_at_monotonic, record_dict)
+_TOKEN_CACHE: dict[int, tuple[float, dict]] = {}
+TOKEN_CACHE_TTL = 300  # seconds
+
+# Snowflake store settings TTL cache: store_id → (fetched_at_monotonic, settings_dict)
+_STORE_SETTINGS_CACHE: dict[int, tuple[float, dict]] = {}
+STORE_SETTINGS_CACHE_TTL = 300  # seconds
+
+
+def _fetch_store_settings_sync(conn, store_id: int) -> dict:
+    """Fetch rate_limit_multiplier and internal_tokens_limit from store.general_attributes."""
+    import json as _json
+    import time as _time
+
+    cached = _STORE_SETTINGS_CACHE.get(store_id)
+    if cached and (_time.monotonic() - cached[0]) < STORE_SETTINGS_CACHE_TTL:
+        return cached[1]
+
+    cur = conn.cursor()
+    cur.execute("SELECT general_attributes FROM store WHERE id = %s LIMIT 1", (store_id,))
+    row = cur.fetchone()
+    cur.close()
+
+    if not row or not row[0]:
+        result = {}
+    else:
+        raw = row[0]
+        try:
+            attrs = _json.loads(raw) if isinstance(raw, str) else (raw if isinstance(raw, dict) else {})
+        except Exception:
+            attrs = {}
+        result = {
+            "rate_limit_multiplier": attrs.get("rate_limit_multiplier"),
+            "internal_tokens_limit": attrs.get("internal_tokens_limit"),
+        }
+
+    _STORE_SETTINGS_CACHE[store_id] = (_time.monotonic(), result)
+    return result
 
 DEFAULT_WINDOW_DAYS = 1
 CLEANUP_MIN_WINDOW_DAYS = 30
@@ -98,8 +140,9 @@ LOAD_SKILL_TOOL = {
         "token_rotation: active tokens or stalled migrations (older token still carries most traffic). "
         "token_cleanup: tokens idle over a >=30-day window. "
         "security_audit: fill % over capacity or anomalous call-rate spikes. "
-        "rate_limit_pressure: when rate_429 > 0 for a token — uses fill % to distinguish burst spikes "
-        "(no action) from sustained over-limit usage (rotation or audit warranted). "
+        "rate_limit_pressure: load when rate_429 > 0 for a token. Evaluates BOTH fill % (sustained load) "
+        "AND the 429 ratio (429_count ÷ total_calls). A high 429 ratio (>10% of calls) warrants action "
+        "even at low fill %, because frequent burst hits are a structural integration problem. "
         "Load the skill(s) relevant to a token before scoring it — do not assume all apply."
     ),
     "input_schema": {
@@ -184,11 +227,12 @@ CLARIFY_WITH_USER_TOOL = {
     "description": (
         "Pause the analysis and ask the user a clarifying question. Use ONLY when the "
         "answer would change which tool gets called next or which recommendation gets made. "
-        "Hard blockers that always require clarification: no store_id anywhere in the "
-        "request or prior context; a named token ID that does not exist for the store; "
-        "two same-named tokens where migration status changes urgency. "
-        "Do NOT ask about: vague timeframes (default to 7 days and disclose); the meaning "
-        "of 'unused' (token_cleanup.md already defines this); anything answerable from data alone."
+        "Hard blockers that always require clarification: no store_id AND no token IDs in "
+        "the request (truly nothing to look up); two same-named tokens where migration "
+        "status changes urgency. "
+        "Do NOT ask about: store_id when token IDs are known — use lookup_token_store "
+        "instead; vague timeframes (default to 7 days and disclose); the meaning of "
+        "'unused' (token_cleanup.md already defines this); anything answerable from data alone."
     ),
     "input_schema": {
         "type": "object",
@@ -252,9 +296,10 @@ LOOKUP_STORE_TOKENS_TOOL = {
     "name": "lookup_store_tokens",
     "description": (
         "Fetch the token roster (id, name, created_at) for a store from Snowflake. "
-        "Call when you need to know what tokens exist for a store — e.g. for a full audit, "
-        "or to check if a token has same-name siblings. "
-        "Not needed if the user already named specific token IDs and you only need their usage."
+        "Use ONLY for full audits or when you need to discover what tokens exist. "
+        "NEVER call this if the user already named specific token IDs — go straight to "
+        "fetch_token_usage instead. Calling this unnecessarily fetches all tokens when "
+        "only one was asked about."
     ),
     "input_schema": {
         "type": "object",
@@ -262,6 +307,23 @@ LOOKUP_STORE_TOKENS_TOOL = {
             "store_id": {"type": "integer"},
         },
         "required": ["store_id"],
+    },
+}
+
+LOOKUP_TOKEN_STORE_TOOL = {
+    "name": "lookup_token_store",
+    "description": (
+        "Given a token ID, look up which store it belongs to in Snowflake. "
+        "Use this whenever the user names a specific token ID but does not provide a store_id — "
+        "do NOT ask the user for the store_id when you can resolve it from Snowflake. "
+        "Returns the store_id, token name, and created_at for the token."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "token_id": {"type": "integer", "description": "The API token ID to look up."},
+        },
+        "required": ["token_id"],
     },
 }
 
@@ -292,6 +354,17 @@ FETCH_429_ERRORS_TOOL = {
     },
 }
 
+LOAD_RATE_LIMIT_DOCS_TOOL = {
+    "name": "load_rate_limit_docs",
+    "description": (
+        "Load the official ReCharge API rate-limit documentation (leaky bucket model, "
+        "bucket size, leak rate, 429 handling, mitigation strategies, rate limit increases). "
+        "Use when answering questions about how rate limiting works, why 429s occur, "
+        "retry strategies, or how to reduce rate-limit pressure."
+    ),
+    "input_schema": {"type": "object", "properties": {}, "required": []},
+}
+
 LOAD_RECHARGE_STATUS_CODES_TOOL = {
     "name": "load_recharge_status_codes",
     "description": (
@@ -309,11 +382,13 @@ LOAD_RECHARGE_STATUS_CODES_TOOL = {
 
 TOOLS = [
     RECORD_INTENT_TOOL,
+    LOOKUP_TOKEN_STORE_TOOL,
     LOOKUP_STORE_TOKENS_TOOL,
     FETCH_TOKEN_USAGE_TOOL,
     FETCH_429_ERRORS_TOOL,
     LOAD_SKILL_TOOL,
     LOAD_RECHARGE_STATUS_CODES_TOOL,
+    LOAD_RATE_LIMIT_DOCS_TOOL,
     SCORE_SINGLE_TOKEN_TOOL,
     VERIFY_SINGLE_TOKEN_TOOL,
     EMIT_RECOMMENDATION_TOOL,
@@ -349,6 +424,246 @@ def _sse(data: dict) -> str:
     return f"data: {json.dumps(data)}\n\n"
 
 
+# ── Claude CLI mode helpers ────────────────────────────────────────────────────────
+
+_TOOL_USE_MARKER = "TOOL_CALL_JSON:"
+
+
+async def _call_claude_cli(prompt: str, model: str = None) -> str:
+    """Call `claude -p` subprocess, stripping API key env vars so session auth is used."""
+    use_model = model or MODEL
+    cmd = ["claude", "-p", "--output-format", "json", "--allowed-tools", "", "--model", use_model]
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run, cmd, input=prompt, capture_output=True, text=True, timeout=180, env=env,
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Claude CLI call timed out after 180s")
+    except FileNotFoundError:
+        raise RuntimeError("'claude' CLI not found — install Claude Code and run `claude login`.")
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"claude CLI exited with code {proc.returncode}")
+    try:
+        envelope = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise RuntimeError(f"Unexpected CLI output: {proc.stdout[:200]}")
+    if envelope.get("is_error"):
+        raise RuntimeError(envelope.get("result", "CLI error"))
+    return envelope.get("result", "")
+
+
+def _build_cli_prompt(system: str, messages: list, tools: list, force_tool: str = None) -> str:
+    """Build a plain-text prompt for CLI mode with embedded tool definitions."""
+    lines = [system.strip(), ""]
+
+    if tools:
+        tool_json = json.dumps(tools, indent=2)
+        lines += [
+            "=" * 70,
+            "## AVAILABLE TOOLS",
+            "",
+            tool_json,
+            "",
+            "## TOOL CALL PROTOCOL",
+            "",
+            "To call a tool, end your response with exactly this on a new line:",
+            f"  {_TOOL_USE_MARKER} {{\"name\": \"tool_name\", \"input\": {{...}}}}",
+            "",
+            "Rules: only ONE tool call per response; no text after the JSON; "
+            "if done (no tool needed), respond normally without the marker.",
+            "=" * 70,
+            "",
+        ]
+
+    if force_tool:
+        lines += [
+            f"IMPORTANT: You MUST call the `{force_tool}` tool in this response.",
+            "",
+        ]
+
+    lines.append("## CONVERSATION")
+    lines.append("")
+
+    for msg in messages:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            lines.append(f"### {role.upper()}")
+            lines.append(content)
+            lines.append("")
+        elif isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                btype = block.get("type")
+                if btype == "text":
+                    lines.append(f"### {role.upper()}")
+                    lines.append(block.get("text", ""))
+                    lines.append("")
+                elif btype == "thinking":
+                    pass
+                elif btype == "tool_use":
+                    lines.append(f"### ASSISTANT (tool call: {block.get('name')})")
+                    lines.append(f"Input: {json.dumps(block.get('input', {}))}")
+                    lines.append("")
+                elif btype == "tool_result":
+                    lines.append("### TOOL RESULT")
+                    lines.append(str(block.get("content", "")))
+                    lines.append("")
+
+    lines.append("### ASSISTANT")
+    return "\n".join(lines)
+
+
+def _parse_cli_response(response: str, known_tools: set) -> tuple:
+    """Parse CLI response into (text_or_None, tool_call_or_None)."""
+    marker_pos = response.rfind(_TOOL_USE_MARKER)
+    if marker_pos == -1:
+        return response.strip(), None
+
+    pre_text = response[:marker_pos].strip()
+    call_json_text = response[marker_pos + len(_TOOL_USE_MARKER):].strip()
+
+    try:
+        call_data = json.loads(call_json_text)
+        name = call_data.get("name", "")
+        inp = call_data.get("input", {})
+        if name in known_tools:
+            tool_call = {
+                "type": "tool_use",
+                "id": f"cli_{uuid.uuid4().hex[:12]}",
+                "name": name,
+                "input": inp,
+            }
+            return pre_text or None, tool_call
+    except (json.JSONDecodeError, AttributeError):
+        pass
+
+    return response.strip(), None
+
+
+async def _run_judge_cli(token_record: dict, score_data: dict, window_days: float) -> dict:
+    """Run the independent judge using the CLI subprocess."""
+    scores_map = {
+        "token_rotation": score_data.get("rotation_score", 0),
+        "token_cleanup":  score_data.get("cleanup_score", 0),
+        "security_audit": score_data.get("security_audit_score", 0),
+    }
+    best = max(scores_map, key=lambda k: scores_map[k])
+    best = best if max(scores_map.values()) >= 20 else "no_action"
+
+    fp = token_record.get("fill_pct") or {}
+    fill_str = " | ".join(f"{tier}: {fp.get(tier, 0)}%" for tier in RATE_TIERS) if fp else "n/a"
+    data_block = (
+        f"Token id={token_record['id']} name=\"{token_record['name']}\" age={token_record.get('age_days', -1)}d\n"
+        f"calls={token_record.get('splunk_count')} calls/s={token_record.get('calls_per_second')} "
+        f"rate_429={token_record.get('rate_429', 0)}\n"
+        f"fill%: {fill_str}\n"
+        f"shares_name_with={token_record.get('other_tokens_with_same_name', 0)} other token(s)\n"
+        f"Observation window: {window_days} days (cleanup requires >= {CLEANUP_MIN_WINDOW_DAYS})\n"
+    )
+    scores_block = (
+        f"rotation={scores_map['token_rotation']} — {score_data.get('rotation_reasoning', '')}\n"
+        f"cleanup={scores_map['token_cleanup']} — {score_data.get('cleanup_reasoning', '')}\n"
+        f"security_audit={scores_map['security_audit']} — {score_data.get('security_audit_reasoning', '')}\n"
+        f"Implied action: {best}"
+    )
+    skills_block = "\n\n".join(
+        f"--- {n} ---\n{_load_text(SKILLS_DIR / f'{n}.md')}" for n in SKILL_NAMES
+    )
+    judge_prompt = (
+        f"You are a SKEPTICAL independent auditor of API-token scoring.\n"
+        f"Approve ONLY if every score is fully supported by the data.\n"
+        f"Reject if: cleanup scored on active token (calls/s > 0); cleanup window < {CLEANUP_MIN_WINDOW_DAYS} days; "
+        f"score unsupported by data; recommended action contradicts usage.\n"
+        f"ALWAYS approve 'insufficient_data' when 0 calls and window < {CLEANUP_MIN_WINDOW_DAYS} days.\n\n"
+        f"TOKEN DATA:\n{data_block}\n\nPROPOSED SCORES:\n{scores_block}\n\nSKILL CRITERIA:\n{skills_block}\n\n"
+        f"Respond with EXACTLY this JSON (no other text):\n"
+        f'{{\"approved\": true, \"objections\": [], \"reasoning\": \"...\"}}'
+    )
+    try:
+        response = await _call_claude_cli(judge_prompt, JUDGE_MODEL)
+        start = response.find("{")
+        end = response.rfind("}") + 1
+        if start >= 0 and end > start:
+            v = json.loads(response[start:end])
+            return {
+                "approved": bool(v.get("approved", False)),
+                "objections": v.get("objections", []),
+                "reasoning": v.get("reasoning", ""),
+            }
+    except Exception:
+        pass
+    return {"approved": True, "objections": [], "reasoning": "Judge unavailable (CLI mode) — auto-approved."}
+
+
+async def _stream_turn_cli(
+    messages: list,
+    system_prompt: str,
+    tools: list,
+    ctx: dict,
+    tool_choice: dict = None,
+    model: str = None,
+) -> AsyncGenerator[str, None]:
+    """One agent turn using `claude -p` CLI subprocess (no streaming — response appears at once)."""
+    ctx["_turn_assistant_content"] = []
+    ctx["_turn_tool_results"] = []
+    ctx["_turn_has_tool_use"] = False
+    ctx["_clarification_pending"] = None
+    ctx["_turn_error"] = None
+
+    known_tools = {t["name"] for t in tools}
+    force_tool = tool_choice.get("name") if tool_choice and tool_choice.get("type") == "tool" else None
+
+    prompt = _build_cli_prompt(system_prompt, messages, tools, force_tool=force_tool)
+
+    try:
+        response = await _call_claude_cli(prompt, model)
+    except RuntimeError as e:
+        yield _sse({"type": "error", "message": str(e)})
+        ctx["_turn_error"] = str(e)
+        return
+
+    text, tool_call = _parse_cli_response(response, known_tools)
+
+    if tool_call:
+        ctx["_turn_has_tool_use"] = True
+        name = tool_call["name"]
+        inp = tool_call["input"]
+        ctx["_turn_assistant_content"].append(tool_call)
+
+        if name == "clarify_with_user":
+            ctx["_clarification_pending"] = {
+                "tool_use_id": tool_call["id"],
+                "question": inp.get("question", ""),
+                "context": inp.get("context", ""),
+            }
+            yield _sse({
+                "type": "clarification_request",
+                "question": inp.get("question", ""),
+                "context": inp.get("context", ""),
+                "ts": _ts(),
+            })
+        else:
+            result_text, sse_event = await _dispatch_tool(name, inp, ctx)
+            if text:
+                sse_event["narration"] = text[:500]
+            yield _sse({**sse_event, "ts": _ts()})
+            for extra_event in ctx.pop("_pending_sse_events", []):
+                yield _sse({**extra_event, "ts": _ts()})
+            ctx["_turn_tool_results"].append({
+                "type": "tool_result",
+                "tool_use_id": tool_call["id"],
+                "content": result_text,
+            })
+    else:
+        if text:
+            ctx["_turn_assistant_content"].append({"type": "text", "text": text})
+            yield _sse({"type": "content_chunk", "delta": text, "ts": _ts()})
+
+
 def _clean_str(text: str) -> str:
     text = re.sub(r"</\w[\w\-]*>\s*$", "", text.strip())
     text = re.sub(r"<parameter\b[^>]*>.*$", "", text.strip(), flags=re.DOTALL)
@@ -372,9 +687,10 @@ def _build_usage_lookup(raw: list) -> dict:
         if not tid:
             continue
         try:
-            cnt = int(row.get("count", 0))
+            # count=1 when row has no 'count' key (raw request row = 1 request)
+            cnt = int(row.get("count", 1))
         except (ValueError, TypeError):
-            cnt = 0
+            cnt = 1
         lookup[tid] = lookup.get(tid, 0) + cnt
     return lookup
 
@@ -386,9 +702,9 @@ def _build_endpoint_summary(detail_rows: list) -> str:
         path = row.get("full_path", "")
         status = str(row.get("status_code", ""))
         try:
-            cnt = int(row.get("count", 0))
+            cnt = int(row.get("count", 1))  # raw row = 1 request
         except (ValueError, TypeError):
-            cnt = 0
+            cnt = 1
         key = f"{method} {path}"
         if key not in endpoint_counts:
             endpoint_counts[key] = {"total": 0, "by_status": {}}
@@ -418,9 +734,9 @@ def _enrich(store_id: int, tokens: list, detail_raw: list, window_seconds: int) 
         if str(row.get("status_code", "")) == "429":
             tid = str(row.get("access_token_id", ""))
             try:
-                cnt = int(row.get("count", 0))
+                cnt = int(row.get("count", 1))  # raw row = 1 request
             except (ValueError, TypeError):
-                cnt = 0
+                cnt = 1
             rate_limit_429[tid] = rate_limit_429.get(tid, 0) + cnt
 
     detail_by_token = _build_detail_by_token(detail_raw)
@@ -476,7 +792,22 @@ def _enrich(store_id: int, tokens: list, detail_raw: list, window_seconds: int) 
     }
 
 
-def _usage_summary(enriched: dict) -> str:
+def _format_store_settings(settings: dict) -> str:
+    if not settings:
+        return ""
+    parts = []
+    rlm = settings.get("rate_limit_multiplier")
+    itl = settings.get("internal_tokens_limit")
+    if rlm is not None:
+        parts.append(f"rate_limit_multiplier={rlm}")
+    if itl is not None:
+        parts.append(f"internal_tokens_limit={itl}")
+    if not parts:
+        return ""
+    return f"Store settings: {', '.join(parts)}.\n"
+
+
+def _usage_summary(enriched: dict, store_settings: dict = None) -> str:
     tokens = enriched["tokens"]
     window = enriched["window_seconds"]
     orphaned = enriched.get("orphaned_tokens", [])
@@ -492,10 +823,29 @@ def _usage_summary(enriched: dict) -> str:
         for tier, info in RATE_TIERS.items()
     ) if total_calls else "no usage data"
 
+    # Surface actual rate limit from store settings when available
+    settings = store_settings or {}
+    rate_mult = settings.get("rate_limit_multiplier")
+    actual_tier_line = ""
+    if rate_mult:
+        try:
+            actual_leak_rate = float(rate_mult) * 2  # base rate is 2 calls/s
+            actual_fill = round(total_cps / actual_leak_rate * 100, 1) if total_calls else 0
+            actual_tier_line = (
+                f"ACTUAL store rate limit (rate_limit_multiplier={rate_mult} → "
+                f"leak_rate={actual_leak_rate}/s): store fill = {actual_fill}%"
+            )
+        except (TypeError, ValueError):
+            pass
+
     lines = [
         f"Usage window: {window_days} days ({window}s)",
         f"Store total: {total_calls} calls (known={known_calls}, orphaned={orphaned_calls}), avg {total_cps} calls/s",
-        f"Store fill % by tier: {store_fill}",
+    ]
+    if actual_tier_line:
+        lines.append(actual_tier_line)
+    lines += [
+        f"Store fill % by tier (for reference): {store_fill}",
         "",
         "Fill % = avg_calls_per_second ÷ leak_rate × 100. Tiers:",
         "  nonpro_1x1: 2/s·40 | nonpro_2x1: 4/s·40 | pro_2x2: 4/s·80 | pro_5x3: 10/s·120 | pro_10x3: 20/s·120",
@@ -607,9 +957,12 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
         ctx["fetch_count"] = ctx.get("fetch_count", 0) + 1
         is_re_query = ctx["fetch_count"] > 1
         prev_window_days = ctx["max_window_days"] if is_re_query else None
+        # Filter to known token IDs so the query is scoped; fall back to store-wide.
+        known_token_ids = [t["id"] for t in ctx.get("tokens", []) if t.get("id")]
         try:
             res = await asyncio.to_thread(
-                splunk_client.fetch_store_usage, ctx["store_id"], window_days, "days"
+                splunk_client.fetch_store_usage, ctx["store_id"], window_days, "days",
+                token_ids=known_token_ids or None,
             )
             if res.get("redirect"):
                 return (
@@ -649,7 +1002,7 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
                         "rate_429": 0,
                         "detail": [],
                     }
-        summary = _usage_summary(enriched)
+        summary = _usage_summary(enriched, ctx.get("store_settings"))
         splunk_rows = [
             {
                 "id": t["id"],
@@ -677,9 +1030,12 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
         window_secs = window_days * 86400
         token_ids_filter = {str(i) for i in inp.get("token_ids", [])}
 
+        # Pass token_ids from tool input (or fall back to known roster) to scope the query.
+        splunk_token_ids = list(inp.get("token_ids", [])) or [t["id"] for t in ctx.get("tokens", []) if t.get("id")]
         try:
             res = await asyncio.to_thread(
-                splunk_client.fetch_store_usage, ctx["store_id"], window_days, "days"
+                splunk_client.fetch_store_usage, ctx["store_id"], window_days, "days",
+                token_ids=splunk_token_ids or None,
             )
             if res.get("redirect"):
                 return (
@@ -746,6 +1102,9 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
             },
         )
 
+    if name == "load_rate_limit_docs":
+        return ((SKILLS_DIR / "rate_limit_docs.md").read_text(), {"type": "rate_limit_docs"})
+
     if name == "load_skill":
         skill = inp.get("skill_name", "")
         if skill not in SKILL_NAMES:
@@ -810,7 +1169,10 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
                 {"type": "step", "tool": name, "label": f"Verify blocked: {token_id} not scored", "detail": ""},
             )
         window_days = round(ctx["window_seconds"] / 86400, 2)
-        verdict = await _run_judge(ctx["client"], record, score_data, window_days)
+        if ctx.get("auth_mode") == "claude_cli":
+            verdict = await _run_judge_cli(record, score_data, window_days)
+        else:
+            verdict = await _run_judge(ctx["client"], record, score_data, window_days)
         ctx["verified"][token_id] = verdict
         approved = verdict["approved"]
         objections = verdict.get("objections", [])
@@ -884,10 +1246,159 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
         label = " — ".join(label_parts)
 
         result_parts = [f"Intent recorded: {request_type}. Requires recommendation: {requires_rec}."]
+
+        if token_ids and ctx.get("conn"):
+            # Pre-fetch: Snowflake token lookup + Splunk in parallel
+            conn = ctx["conn"]
+            first_token_id = token_ids[0]
+
+            _TOKEN_SQL = (
+                "SELECT STORE_ID, API_TOKEN_ID AS id, NAME AS name, CREATED_AT "
+                "FROM API_TOKEN WHERE API_TOKEN_ID = %s AND _FIVETRAN_DELETED = FALSE LIMIT 1"
+            )
+
+            def _fetch_token_record():
+                cur = conn.cursor()
+                cur.execute(_TOKEN_SQL, (first_token_id,))
+                cols = [c[0].lower() for c in cur.description]
+                row = cur.fetchone()
+                cur.close()
+                if not row:
+                    return None
+                rec = dict(zip(cols, row))
+                if rec.get("created_at"):
+                    rec["created_at"] = str(rec["created_at"])
+                return rec
+
+            # Check TTL cache before hitting Snowflake
+            import time as _time
+            _cached = _TOKEN_CACHE.get(first_token_id)
+            if _cached and (_time.monotonic() - _cached[0]) < TOKEN_CACHE_TTL:
+                token_rec = _cached[1]
+            else:
+                try:
+                    token_rec = await asyncio.to_thread(_fetch_token_record)
+                    if token_rec:
+                        _TOKEN_CACHE[first_token_id] = (_time.monotonic(), token_rec)
+                except Exception as e:
+                    token_rec = None
+                    result_parts.append(f"Snowflake lookup failed: {e}. Will need store_id from user.")
+
+            if token_rec:
+                found_store_id = int(token_rec["store_id"])
+                ctx["store_id"] = found_store_id
+                ctx["tokens"] = [{"id": token_rec["id"], "name": token_rec["name"], "created_at": token_rec["created_at"]}]
+                ctx["total_tokens"] = 1
+
+                ctx.setdefault("_pending_sse_events", []).append({
+                    "type": "step",
+                    "tool": "lookup_token_store",
+                    "call": f"lookup_token_store(token_id={first_token_id})",
+                    "label": f"Token {first_token_id} → store {found_store_id}",
+                    "detail": f"\"{token_rec['name']}\" — resolved from Snowflake",
+                })
+
+                # Pre-fetch Splunk + store settings in parallel now that we have store_id
+                window_days = 1
+                window_secs = window_days * 86400
+                try:
+                    splunk_res, store_settings = await asyncio.gather(
+                        asyncio.to_thread(
+                            splunk_client.fetch_store_usage, found_store_id, window_days, "days",
+                            token_ids=[first_token_id],
+                        ),
+                        asyncio.to_thread(_fetch_store_settings_sync, conn, found_store_id),
+                        return_exceptions=True,
+                    )
+                    if isinstance(store_settings, dict):
+                        ctx["store_settings"] = store_settings
+                        settings_label = _format_store_settings(store_settings).rstrip(".\n")
+                        if settings_label:
+                            ctx.setdefault("_pending_sse_events", []).append({
+                                "type": "step", "tool": "lookup_store_settings",
+                                "label": f"Store settings loaded",
+                                "detail": settings_label,
+                            })
+                    if isinstance(splunk_res, Exception):
+                        raise splunk_res
+                    if splunk_res.get("redirect"):
+                        ctx.setdefault("_pending_sse_events", []).append({
+                            "type": "step", "tool": "fetch_token_usage",
+                            "label": "Splunk pre-fetch blocked — auth required", "detail": "",
+                        })
+                        result_parts.append("Splunk auth required — no usage data pre-fetched.")
+                    else:
+                        enriched = _enrich(found_store_id, ctx["tokens"], splunk_res["store_detail_usage"], window_secs)
+                        ctx["window_seconds"] = window_secs
+                        ctx["max_window_days"] = window_days
+                        ctx["fetch_count"] = 1
+                        for rec in enriched["tokens"]:
+                            ctx["token_records"][rec["id"]] = rec
+                        ctx["orphaned"] = enriched.get("orphaned_tokens", [])
+                        if not ctx["tokens"]:
+                            for orec in ctx["orphaned"]:
+                                tid = orec["id"]
+                                if tid not in ctx["token_records"]:
+                                    ctx["token_records"][int(tid)] = {
+                                        "id": int(tid), "name": f"id={tid}",
+                                        "splunk_count": orec.get("count", 0),
+                                        "calls_per_second": orec.get("calls_per_second", 0),
+                                        "fill_pct": {
+                                            t: round(orec.get("calls_per_second", 0) / info["leak_rate"] * 100, 1)
+                                            for t, info in RATE_TIERS.items()
+                                        },
+                                        "rate_429": 0, "detail": [],
+                                    }
+                        summary = _usage_summary(enriched, ctx.get("store_settings"))
+                        splunk_rows = [
+                            {"id": t["id"], "name": t["name"], "calls": t["splunk_count"],
+                             "cps": t["calls_per_second"], "rate_429": t["rate_429"],
+                             "fill_top": round(max(t["fill_pct"].values()), 1) if t.get("fill_pct") else 0}
+                            for t in enriched["tokens"]
+                        ]
+                        ctx.setdefault("_pending_sse_events", []).append({
+                            "type": "step", "tool": "fetch_token_usage",
+                            "call": f"fetch_token_usage(window_days={window_days})",
+                            "label": f"Splunk pre-fetched: {window_days}-day window",
+                            "detail": f"{enriched['total']} token(s), {len(ctx['orphaned'])} orphaned",
+                            "splunk_rows": splunk_rows,
+                            "re_query": False,
+                        })
+                        settings = ctx.get("store_settings", {})
+                        settings_note = _format_store_settings(settings)
+                        result_parts.append(
+                            f"Token {first_token_id} (\"{token_rec['name']}\") is in store {found_store_id}. "
+                            f"Splunk data pre-fetched ({window_days}d window). "
+                            f"Usage summary:\n{summary}\n"
+                            f"{settings_note}"
+                            f"This data is already loaded — do NOT call fetch_token_usage or lookup_token_store. "
+                            f"Use this data directly to answer the user's request."
+                        )
+                except Exception as _splunk_err:
+                    result_parts.append(
+                        f"Splunk pre-fetch failed: {_splunk_err}. "
+                        f"Token is in store {found_store_id} — call fetch_token_usage to get usage data."
+                    )
+            else:
+                result_parts.append(
+                    f"Token {first_token_id} not found in Snowflake. "
+                    f"It may not exist or may have been deleted. Ask the user to verify the token ID."
+                )
+
+        elif token_ids:
+            # No Snowflake connection
+            result_parts.append(
+                f"Token IDs specified: {token_ids}. No Snowflake connection available — "
+                f"ask the user which store the token belongs to."
+            )
+
         if open_questions:
-            qs = "; ".join(open_questions)
-            result_parts.append(f"Open questions that must be resolved before proceeding: {qs}. "
-                                 f"Call clarify_with_user now.")
+            # Filter out "no store_id given" when we already resolved it via token lookup
+            actionable_qs = [q for q in open_questions if not (token_ids and "store_id" in q.lower())]
+            if actionable_qs:
+                qs = "; ".join(actionable_qs)
+                result_parts.append(f"Open questions that must be resolved before proceeding: {qs}. "
+                                     f"Call clarify_with_user now.")
 
         return (
             " ".join(result_parts),
@@ -940,7 +1451,15 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
             return result
 
         try:
-            tokens = await asyncio.to_thread(_run_query)
+            tokens, store_settings = await asyncio.gather(
+                asyncio.to_thread(_run_query),
+                asyncio.to_thread(_fetch_store_settings_sync, conn, store_id),
+                return_exceptions=True,
+            )
+            if isinstance(tokens, Exception):
+                raise tokens
+            if isinstance(store_settings, dict):
+                ctx["store_settings"] = store_settings
         except Exception as e:
             return (
                 f"Snowflake query failed: {e}",
@@ -956,9 +1475,10 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
             for t in tokens
         )
         roster_summary = [{"id": t["id"], "name": t["name"], "created_at": t["created_at"]} for t in tokens]
+        settings_note = _format_store_settings(ctx.get("store_settings", {}))
 
         return (
-            f"Store {store_id} has {len(tokens)} token(s):\n{roster_lines}",
+            f"Store {store_id} has {len(tokens)} token(s):\n{roster_lines}\n{settings_note}",
             {
                 "type": "step",
                 "tool": name,
@@ -966,6 +1486,71 @@ async def _dispatch_tool(name: str, inp: dict, ctx: dict):
                 "label": f"Roster: {len(tokens)} token(s) for store {store_id}",
                 "detail": f"{len(tokens)} token(s) fetched from Snowflake",
                 "roster": roster_summary,
+            },
+        )
+
+    if name == "lookup_token_store":
+        conn = ctx.get("conn")
+        if conn is None:
+            return (
+                "Snowflake connection not available — cannot look up token store. "
+                "Ask the user which store the token belongs to.",
+                {"type": "step", "tool": name, "label": "Token lookup blocked — no Snowflake", "detail": ""},
+            )
+        token_id = int(inp.get("token_id", 0))
+        if not token_id:
+            return (
+                "No token_id provided to lookup_token_store.",
+                {"type": "step", "tool": name, "label": "Token lookup blocked — no token_id", "detail": ""},
+            )
+
+        _SQL = (
+            "SELECT STORE_ID, API_TOKEN_ID AS id, NAME AS name, CREATED_AT "
+            "FROM API_TOKEN "
+            "WHERE API_TOKEN_ID = %s AND _FIVETRAN_DELETED = FALSE "
+            "LIMIT 1"
+        )
+
+        def _run_token_query():
+            cur = conn.cursor()
+            cur.execute(_SQL, (token_id,))
+            cols = [c[0].lower() for c in cur.description]
+            row = cur.fetchone()
+            cur.close()
+            if not row:
+                return None
+            rec = dict(zip(cols, row))
+            if rec.get("created_at"):
+                rec["created_at"] = str(rec["created_at"])
+            return rec
+
+        try:
+            rec = await asyncio.to_thread(_run_token_query)
+        except Exception as e:
+            return (
+                f"Snowflake query failed: {e}",
+                {"type": "step", "tool": name, "label": "Token lookup error", "detail": str(e)},
+            )
+
+        if rec is None:
+            return (
+                f"Token {token_id} not found in Snowflake. It may not exist or may have been deleted.",
+                {"type": "step", "tool": name, "label": f"Token {token_id} not found", "detail": ""},
+            )
+
+        found_store_id = int(rec["store_id"])
+        ctx["store_id"] = found_store_id
+
+        return (
+            f"Token {token_id} belongs to store {found_store_id} "
+            f"(name: \"{rec['name']}\", created_at: {rec['created_at']}). "
+            f"Proceed with fetch_token_usage for store {found_store_id}.",
+            {
+                "type": "step",
+                "tool": name,
+                "call": f"lookup_token_store(token_id={token_id})",
+                "label": f"Token {token_id} → store {found_store_id}",
+                "detail": f"\"{rec['name']}\" — resolved from Snowflake",
             },
         )
 
@@ -981,6 +1566,7 @@ async def _stream_turn(
     tools: list,
     ctx: dict,
     tool_choice: dict = None,
+    model: str = None,
 ) -> AsyncGenerator[str, None]:
     """Stream one LLM turn. Populates ctx['_turn_*']. Yields SSE strings."""
     ctx["_turn_assistant_content"] = []
@@ -991,16 +1577,22 @@ async def _stream_turn(
 
     narration_parts: list = []
 
+    use_model = model or MODEL
+    use_thinking = use_model != FAST_MODEL  # Haiku doesn't support extended thinking
+
     try:
-        async with client.messages.stream(
-            model=MODEL,
-            max_tokens=16000,
-            thinking={"type": "adaptive", "display": "summarized"},
+        stream_kwargs = dict(
+            model=use_model,
+            max_tokens=8192 if use_model == FAST_MODEL else 16000,
             system=system_prompt,
             tools=tools,
             tool_choice=tool_choice or {"type": "auto"},
             messages=messages,
-        ) as stream:
+        )
+        if use_thinking:
+            stream_kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
+
+        async with client.messages.stream(**stream_kwargs) as stream:
             # Real-time streaming events
             async for event in stream:
                 etype = getattr(event, "type", None)
@@ -1078,6 +1670,9 @@ async def _stream_turn(
                     sse_event["narration"] = narration
                     first_tool = False
                 yield _sse({**sse_event, "ts": _ts()})
+                # Drain any bonus events queued by the dispatch (e.g. pre-fetches)
+                for extra_event in ctx.pop("_pending_sse_events", []):
+                    yield _sse({**extra_event, "ts": _ts()})
                 ctx["_turn_tool_results"].append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -1092,6 +1687,8 @@ async def _stream_turn(
 # ── Token scores builder ──────────────────────────────────────────────────────────
 
 def _build_token_scores(ctx: dict) -> list:
+    analyzed_tids = set(ctx.get("scored", {})) | set(ctx.get("recommendations", {}))
+
     if not ctx.get("tokens"):
         # Free-form path without a roster — build only from what was actually recommended.
         result = []
@@ -1166,6 +1763,9 @@ def _build_token_scores(ctx: dict) -> list:
                 "verification_reasoning": ver.get("reasoning", ""),
             })
         else:
+            # Skip tokens that were never touched when at least one other token was analyzed.
+            if analyzed_tids:
+                continue
             base.update({
                 "rotation_score": 0, "rotation_reasoning": "",
                 "cleanup_score": 0, "cleanup_reasoning": "",
@@ -1184,15 +1784,18 @@ async def run_agent_loop(
     data: dict,
     session: Optional[dict] = None,
     conn=None,
+    auth_mode: str = "api_key",
 ) -> AsyncGenerator[str, None]:
     from memory_store import build_memory_context, save_run
 
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        yield _sse({"type": "error", "message": "ANTHROPIC_API_KEY not set. Add it to backend/.env."})
-        return
-
-    client = anthropic.AsyncAnthropic(api_key=api_key)
+    if auth_mode == "claude_cli":
+        client = None
+    else:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            yield _sse({"type": "error", "message": "ANTHROPIC_API_KEY not set. Add it to backend/.env."})
+            return
+        client = anthropic.AsyncAnthropic(api_key=api_key)
     system_prompt = _load_text(SKILLS_DIR / "system_prompt.md")
 
     tokens = data.get("tokens") or []
@@ -1242,6 +1845,7 @@ async def run_agent_loop(
 
     ctx: dict = {
         "client": client,
+        "auth_mode": auth_mode,
         "store_id": store_id,
         "tokens": tokens,
         "total_tokens": len(tokens),
@@ -1257,6 +1861,7 @@ async def run_agent_loop(
         "prev_scored": set(),
         "intent": None,
         "conn": conn,
+        "store_settings": {},
     }
 
     if session:
@@ -1274,8 +1879,18 @@ async def run_agent_loop(
         if free_form and turn_count == 1:
             turn_tool_choice = {"type": "tool", "name": "record_intent"}
 
-        async for event_str in _stream_turn(client, messages, system_prompt, TOOLS, ctx, tool_choice=turn_tool_choice):
-            yield event_str
+        if auth_mode == "claude_cli":
+            async for event_str in _stream_turn_cli(messages, system_prompt, TOOLS, ctx,
+                                                    tool_choice=turn_tool_choice):
+                yield event_str
+        else:
+            # Use FAST_MODEL (Haiku) for structured scoring/verification turns
+            turn_model = None
+            if turn_count > 1 and ctx.get("token_records"):
+                turn_model = FAST_MODEL
+            async for event_str in _stream_turn(client, messages, system_prompt, TOOLS, ctx,
+                                                tool_choice=turn_tool_choice, model=turn_model):
+                yield event_str
 
         if ctx.get("_turn_error"):
             return
@@ -1379,9 +1994,38 @@ async def run_agent_loop(
 async def run_chat_turn(
     session: dict,
     user_message: str,
+    auth_mode: str = "api_key",
 ) -> AsyncGenerator[str, None]:
     """Single follow-up turn on an already-completed session."""
     from session_store import update_dialogue
+
+    system_prompt = _load_text(SKILLS_DIR / "system_prompt.md")
+    chat_system = (
+        system_prompt
+        + "\n\nYou are now in follow-up chat mode. Answer the user's question based on the "
+        "analysis you just completed. Be concise and cite specific fill percentages and token "
+        "IDs from your earlier analysis."
+    )
+
+    update_dialogue(session, "human", user_message)
+    session["messages"].append({"role": "user", "content": user_message})
+    session["status"] = "running"
+
+    if auth_mode == "claude_cli":
+        prompt = _build_cli_prompt(chat_system, session["messages"], [])
+        try:
+            reply_text = await _call_claude_cli(prompt, MODEL)
+        except RuntimeError as e:
+            session["status"] = "error"
+            yield _sse({"type": "error", "message": str(e)})
+            return
+        reply_text = reply_text.strip()
+        yield _sse({"type": "content_chunk", "delta": reply_text, "ts": _ts()})
+        session["messages"].append({"role": "assistant", "content": [{"type": "text", "text": reply_text}]})
+        update_dialogue(session, "assistant", reply_text)
+        session["status"] = "ready"
+        yield _sse({"type": "chat_done", "ts": _ts()})
+        return
 
     api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
@@ -1389,17 +2033,12 @@ async def run_chat_turn(
         return
 
     client = anthropic.AsyncAnthropic(api_key=api_key)
-    system_prompt = _load_text(SKILLS_DIR / "system_prompt.md")
-
-    update_dialogue(session, "human", user_message)
-    session["messages"].append({"role": "user", "content": user_message})
-    session["status"] = "running"
 
     try:
         async with client.messages.stream(
             model=MODEL,
             max_tokens=4096,
-            system=system_prompt + "\n\nYou are now in follow-up chat mode. Answer the user's question based on the analysis you just completed. Be concise and cite specific fill percentages and token IDs from your earlier analysis.",
+            system=chat_system,
             messages=session["messages"],
         ) as stream:
             async for event in stream:

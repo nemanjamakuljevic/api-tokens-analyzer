@@ -12,9 +12,10 @@ interface Props {
   storeId: number;
   formSlot?: ReactNode;
   statusSlot?: ReactNode;
+  authMode?: string | null;
 }
 
-export default function TokensTable({ tokens, storeId, formSlot, statusSlot }: Props) {
+export default function TokensTable({ tokens, storeId, formSlot, statusSlot, authMode }: Props) {
   const [analyzeKey, setAnalyzeKey] = useState(0);
 
   function handleReanalyze() {
@@ -69,6 +70,7 @@ export default function TokensTable({ tokens, storeId, formSlot, statusSlot }: P
             storeId={storeId}
             tokens={tokens}
             chatFirst={true}
+            authMode={authMode}
             onReanalyze={handleReanalyze}
             onClose={() => {}}
           />

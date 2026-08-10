@@ -14,6 +14,7 @@ interface AgentPanelProps {
   userMessage?: string;
   freeForm?: boolean;
   freeFormMessage?: string;
+  authMode?: string | null;
   onClose: () => void;
   onReanalyze?: () => void;
 }
@@ -616,6 +617,7 @@ export default function AgentPanel({
   userMessage,
   freeForm,
   freeFormMessage,
+  authMode,
   onClose,
   onReanalyze,
 }: AgentPanelProps) {
@@ -662,8 +664,8 @@ export default function AgentPanel({
       try {
         const url = freeForm ? "/api/chat/ask" : "/api/chat/start";
         const body = freeForm
-          ? { message: pendingMsgRef.current || userMessage || "" }
-          : { store_id: storeId, tokens, user_message: pendingMsgRef.current || userMessage || "" };
+          ? { message: pendingMsgRef.current || userMessage || "", auth_mode: authMode ?? "api_key" }
+          : { store_id: storeId, tokens, user_message: pendingMsgRef.current || userMessage || "", auth_mode: authMode ?? "api_key" };
         const res = await fetch(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -735,7 +737,7 @@ export default function AgentPanel({
 
               } else if (event.type === "step") {
                 let kind: Step["kind"] = "setup";
-                if (event.tool === "fetch_token_usage" || event.tool === "fetch_429_errors" || event.tool === "lookup_store_tokens") kind = "tool:fetch";
+                if (event.tool === "fetch_token_usage" || event.tool === "fetch_429_errors" || event.tool === "lookup_store_tokens" || event.tool === "lookup_token_store") kind = "tool:fetch";
                 else if (event.tool === "load_skill" || event.tool === "load_recharge_status_codes") kind = "tool:skill";
                 else if (event.tool === "score_single_token") kind = "tool:score";
                 else if (event.tool === "verify_single_token_score") kind = "tool:verify";
@@ -1036,7 +1038,7 @@ export default function AgentPanel({
             )}
 
             {/* Streaming agent text */}
-            {started && (streamingText || streamingActive) && (
+            {started && !done && (streamingText || streamingActive) && (
               <div className="px-4 py-3 border-b border-gray-100">
                 <StreamingText text={streamingText} active={streamingActive} />
               </div>
