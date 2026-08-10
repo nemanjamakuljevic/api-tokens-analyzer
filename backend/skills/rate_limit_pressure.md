@@ -8,6 +8,25 @@ A token at 12% fill on nonpro_1x1 with 429s is hitting burst spikes — the aver
 
 **Fill % is the primary signal. 429 count confirms the problem exists, not how bad it is.**
 
+## Stale Rate-Limit Prefix (Special Case)
+
+A known Recharge platform failure mode: if the Redis rate-limit prefix for a store becomes stale, 429 errors appear even when average traffic is well within the actual rate limit. The rate limit is enforced against a ghost key — not the live bucket.
+
+**Signature (all three must be present):**
+- 429 ratio > 20% of total calls
+- Actual-tier fill % < 15% (traffic volume alone cannot explain the 429 rate)
+- No obvious burst pattern (429s distributed throughout the window, not clustered at specific times)
+
+**What this is NOT:**
+- A burst spike: bursts cluster at specific times; a stale prefix causes consistent 429s spread across the window
+- A fill % problem: stale prefix 429s appear even when average load is low
+
+**How to score and recommend when this pattern matches:**
+- Do NOT score for `token_rotation` — redistributing load across tokens won't fix a Redis key issue
+- Set `security_audit_score` to 50–70 with reasoning: "High 429 ratio ({x}%) despite low actual-tier fill % ({y}%) — pattern is consistent with a stale Redis rate-limit prefix. This is a platform infrastructure issue, not a token load issue."
+- Recommended action: `security_audit`
+- In the recommendation text, include: "Escalate to the platform team to inspect and reset the rate-limit prefix key for store {store_id}. Do not attempt to resolve with token rotation or traffic reduction — the issue is in the rate-limit key state, not in the traffic volume."
+
 ## Tier Reference (fill_pct = calls/s ÷ leak_rate × 100)
 
 **Use the store's actual rate limit when available.** The usage summary includes an "ACTUAL store rate limit" line derived from `rate_limit_multiplier` in `store.general_attributes` (leak_rate = multiplier × 2 calls/s). Always use that fill % for your analysis — do not default to nonpro_1x1 if the actual tier is known.

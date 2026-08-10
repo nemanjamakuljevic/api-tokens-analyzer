@@ -1,13 +1,61 @@
 [
   {
-    "date": "2026-07-30",
-    "session_id": "03700822-00b4-4dfa-bc7a-d6cdd87995bc",
-    "store_summary": "## Store-Level Summary\n\nStore 1 has a single API token, **id=1108485** (**'Test Token'**). Usage was checked across both a 7-day and, after finding zero calls, an extended 45-day observation window. In both cases, the token recorded **0 calls** and **0.0% fill** across every rate-limit tier. With no",
-    "window_days": 45,
+    "date": "2026-08-05",
+    "session_id": "526f43b6-f460-44b6-9800-b2da2c6ddb50",
+    "store_summary": "The verification/emit loop appears to have a structural issue. Let me take a step back and provide the analysis directly to the user based on the data I have:\n\n---\n\n## Analysis for Token **988421** (\"Zaymo\")\n\n**Data Summary:**\n- **Store:** 1  \n- **Token ID:** 988421  \n- **Token Name:** Zaymo  \n- **T",
+    "window_days": 1,
     "token_outcomes": [
       {
-        "token_id": 1108485,
-        "action": "token_cleanup"
+        "token_id": 988421,
+        "action": "no_action"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-05",
+    "session_id": "0e555406-6b94-4198-a137-fc7e7e76672e",
+    "store_summary": "## Summary\n\nToken **id=988421** (**'Zaymo'**) in store 1 is currently **not flagged for any immediate action**. \n\nThe token shows minimal activity (0.0013 calls/s, 0.1% fill max across all tiers) over a 1-day observation window. While this sparse usage may suggest the token could be a cleanup candid",
+    "window_days": 1,
+    "token_outcomes": [
+      {
+        "token_id": 988421,
+        "action": "insufficient_data"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-05",
+    "session_id": "8d56f83b-3211-4604-99c7-10e3ee8bfcef",
+    "store_summary": "---\n\n## Summary\n\n**Token 988421 (\"Zaymo\") Analysis Complete**\n\nThis single token on **store 1** showed minimal activity over the 1-day observation window: **112 API calls** (0.0013 calls/s, **0.1% fill on nonpro_1x1**). The token is 392 days old and primarily issues low-volume address lookups.\n\n**Fi",
+    "window_days": 1,
+    "token_outcomes": [
+      {
+        "token_id": 988421,
+        "action": "no_action"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-05",
+    "session_id": "04d8411c-89e7-4cfa-8595-b9446adc1100",
+    "store_summary": "Perfect! I have the data. Let me answer your question directly:\n\n## Token **988421** (\"Zaymo\") \u2013 Rate Limit Status\n\nToken **988421** has **extremely low usage** and is not approaching any rate limit. Here's the breakdown across all Recharge plan tiers:\n\n| Plan Tier | Leak Rate | Bucket | Fill % |\n|-",
+    "window_days": 1,
+    "token_outcomes": [
+      {
+        "token_id": 988421,
+        "action": "no_action"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-05",
+    "session_id": "f7a04f77-bf1b-4c92-beb3-ed5717f9d64d",
+    "store_summary": "Based on the Splunk data for token **id=988421** (**\"Zaymo\"**):\n\n**Token Rate Limit Tier Analysis:**\n\nThe token's fill percentages across all available Recharge plans are:\n\n| Plan           | Leak Rate | Bucket | Fill %     |\n|----------------|-----------|--------|------------|\n| **Non-pro 1\u00d71** | 2",
+    "window_days": 1,
+    "token_outcomes": [
+      {
+        "token_id": 988421,
+        "action": "no_action"
       }
     ]
   }

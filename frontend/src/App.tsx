@@ -31,7 +31,11 @@ function loadStoredAuthMode(): AuthMode | null {
 }
 
 export default function App() {
-  const [authMode, setAuthMode] = useState<AuthMode | null>(loadStoredAuthMode);
+  // Always ask which transport to use — the two modes behave differently enough
+  // (streaming, extended thinking, one tool per turn) that the choice is part of
+  // the demo, not a setting to hide. The stored value only marks the default.
+  const [authMode, setAuthMode] = useState<AuthMode | null>(null);
+  const [lastUsed] = useState<AuthMode | null>(loadStoredAuthMode);
   const [mode, setMode] = useState<AppMode>("free_form");
 
   // Free-form state
@@ -79,6 +83,7 @@ export default function App() {
   if (!authMode) {
     return (
       <AuthModal
+        lastUsed={lastUsed}
         onSelect={(mode) => {
           localStorage.setItem(AUTH_STORAGE_KEY, mode);
           setAuthMode(mode);

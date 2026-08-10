@@ -1,0 +1,26 @@
+[
+  {
+    "date": "2026-08-05",
+    "session_id": "57932b90-5108-4963-9b60-39d76375b659",
+    "store_summary": "## Summary\n\nToken **id=338751** (`**internal**`) in store **156** is completely idle, showing **0 calls over the past 1 day** with **0.0% fill across all rate-limit tiers**. The token is extremely old (1861 days) and a prime cleanup candidate. \n\n**However**, the cleanup skill requires a **30-day obs",
+    "window_days": 1,
+    "token_outcomes": [
+      {
+        "token_id": 338751,
+        "action": "insufficient_data"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-05",
+    "session_id": "3e9a9fb4-d809-4d6f-bff5-9f814c53747e",
+    "store_summary": "---\n\n## Summary\n\n**Token 338751** (`internal`) in **store 156** shows zero API activity over the 1-day observation window. While its age (1861 days) is a strong indicator of potential dormancy, **the 1-day window is too short to confirm long-term idleness** per token cleanup policy (which requires a",
+    "window_days": 1,
+    "token_outcomes": [
+      {
+        "token_id": 338751,
+        "action": "insufficient_data"
+      }
+    ]
+  }
+]

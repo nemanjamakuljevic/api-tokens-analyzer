@@ -1,109 +1,61 @@
 [
   {
-    "date": "2026-07-30",
-    "session_id": "0d08fd9d-045c-4fec-b239-5bb793df551c",
-    "store_summary": "## Store 151016 \u2014 Summary\n\nAll 7 tokens were checked over a 30-day Splunk observation window after an initial 7-day check showed no activity for any of them. Every single token \u2014 **1130125** (**'leif-T4-2021-01-capture'**), **1130124** (**'leif-T3-payments-only'**), **1045540** (**'leif-T2-orders-pm",
-    "window_days": 30,
-    "token_outcomes": [
-      {
-        "token_id": 1130125,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 1130124,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 1045540,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 976143,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 863365,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 505597,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 505598,
-        "action": "token_cleanup"
-      }
-    ]
-  },
-  {
-    "date": "2026-07-30",
-    "session_id": "3f0f3062-acce-441b-8623-d0ba24facbc1",
-    "store_summary": "## Store-Level Summary \u2014 Store 151016\n\nAll **7 tokens** for this store were analyzed over an initial 7-day window, then confirmed with a full 30-day window after the initial pull showed zero activity across the board.\n\n**Finding:** Every single token \u2014 **'leif-T4-2021-01-capture'** (**id=1130125**),",
-    "window_days": 30,
-    "token_outcomes": [
-      {
-        "token_id": 1130125,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 1130124,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 1045540,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 976143,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 863365,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 505597,
-        "action": "token_cleanup"
-      },
-      {
-        "token_id": 505598,
-        "action": "token_cleanup"
-      }
-    ]
-  },
-  {
-    "date": "2026-07-30",
-    "session_id": "9847add6-bb2b-4e2d-9613-8132709ab5b2",
-    "store_summary": "## Store 151016 \u2014 Rate Limiting Check Summary\n\nChecked rate-limiting exposure across all **7 tokens** using a fresh 1-day Splunk window. **No rate limiting is occurring anywhere in this store right now** \u2014 the store-wide fill percentage was 0.0\u20130.1% across every tier, and no HTTP 429s were observed ",
+    "date": "2026-08-10",
+    "session_id": "dd445d70-bb76-4f1b-b229-b1ac99523db1",
+    "store_summary": "## Why token 863365 (\"Leif the Gread\") is hitting 429s\n\nLooking at the Splunk data for **id=863365** (**'Leif the Gread'**), the picture is a classic **burst mismatch**, not a sustained-capacity problem:\n\n- **Sustained load is negligible**: 805 calls over 24h = 0.0093 calls/s average. Fill % across ",
     "window_days": 1,
     "token_outcomes": [
       {
-        "token_id": 1130125,
-        "action": "insufficient_data"
-      },
-      {
-        "token_id": 1130124,
-        "action": "insufficient_data"
-      },
-      {
-        "token_id": 1045540,
-        "action": "insufficient_data"
-      },
-      {
-        "token_id": 976143,
-        "action": "insufficient_data"
-      },
-      {
         "token_id": 863365,
         "action": "no_action"
-      },
+      }
+    ]
+  },
+  {
+    "date": "2026-08-10",
+    "session_id": "6d2dfbcc-cf33-4194-b48a-5d068f84e966",
+    "store_summary": "**Store-level summary:** Analyzed **id=863365** (**'Leif the Gread'**) as requested. This token runs at negligible average load (0.1% fill on the store's actual pro_5x3 tier) but is hitting a severe rate-limit problem: 399 of 805 calls (49.6%) in the 1-day window returned HTTP 429, almost entirely o",
+    "window_days": 1,
+    "token_outcomes": [
       {
-        "token_id": 505597,
-        "action": "insufficient_data"
-      },
+        "token_id": 863365,
+        "action": "security_audit"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-10",
+    "session_id": "e1ae7017-fa9d-4bbe-be50-382f37ee79f8",
+    "store_summary": "The recommendation for **id=863365** (**'Leif the Gread'**) is finalized: **security_audit** \u2014 sustained load is negligible (0.1% fill on the store's actual pro_5x3 tier), but 399 of 805 calls in the 1-day window returned HTTP 429 (a 49.6% failure ratio, well above the 30% structural-problem thresho",
+    "window_days": 1,
+    "token_outcomes": [
       {
-        "token_id": 505598,
-        "action": "no_action"
+        "token_id": 863365,
+        "action": "security_audit"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-10",
+    "session_id": "510b6972-e786-4877-b9d3-af774eb6378b",
+    "store_summary": "Store-level summary: Token **id=863365** (**'Leif the Gread'**, store 151016) is not overloaded \u2014 actual-tier (pro_5x3) fill is just 0.1%, but 49.6% of its calls (399/805) over the last 6h/1-day window returned HTTP 429. This pattern matches a **stale Redis rate-limit prefix** (platform issue), not ",
+    "window_days": 1,
+    "token_outcomes": [
+      {
+        "token_id": 863365,
+        "action": "security_audit"
+      }
+    ]
+  },
+  {
+    "date": "2026-08-10",
+    "session_id": "3670fc3d-5715-402d-9ce5-69e43e1d2bc3",
+    "store_summary": "**Store 151016 summary:** Token **id=863365** (**'Leif the Gread'**) is healthy on average (0.1% fill on its actual **pro_5x3** tier) but hit a sharp burst of 399 HTTP 429s (49.6% of its 805 calls) in under a second, all against `GET /api/subscriptions`. This was confirmed as a genuine client-side b",
+    "window_days": 1,
+    "token_outcomes": [
+      {
+        "token_id": 863365,
+        "action": "security_audit"
       }
     ]
   }

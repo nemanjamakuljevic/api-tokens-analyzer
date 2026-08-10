@@ -269,5 +269,151 @@ def fetch_store_usage(
     }
 
 
+def build_error_patterns_spl(
+    store_id: int,
+    time_value: int,
+    time_unit: str,
+    token_ids: Optional[list] = None,
+    status_codes: Optional[list] = None,
+) -> str:
+    """SPL for non-success error patterns, grouped by token/method/path/status."""
+    codes = status_codes or ["400", "401", "403", "404", "422", "500", "503"]
+    codes_csv = ", ".join(str(c) for c in codes)
+    earliest = f"-{time_value}{_UNIT_SPL.get(time_unit, 'd')}"
+    token_filter = ""
+    if token_ids:
+        ids_csv = ", ".join(str(t) for t in token_ids)
+        token_filter = f" access_token_id IN ({ids_csv})"
+    return (
+        f'index=k8s-customcheckout-prod store_id={store_id}'
+        f' method IN ("POST","PUT","DELETE","GET")'
+        f' full_path="/*api/*"'
+        f' status_code IN ({codes_csv})'
+        f'{token_filter}'
+        f' earliest={earliest} latest=now\n'
+        '| stats count by access_token_id method full_path status_code\n'
+        '| sort -count'
+    )
+
+
+def build_activity_spl(
+    store_id: int,
+    earliest: str,
+    latest: str = "now",
+    token_id: Optional[int] = None,
+    method: Optional[str] = None,
+    path_contains: Optional[str] = None,
+    status_code: Optional[str] = None,
+    max_rows: int = 100,
+) -> str:
+    """SPL for raw (non-aggregated) request rows within an absolute or relative time window."""
+    token_filter = f" access_token_id={token_id}" if token_id else ""
+    methods = f'"{method}"' if method else '"POST","PUT","DELETE","GET"'
+    safe_path = path_contains.replace('"', "").replace("*", "") if path_contains else None
+    path_filter = f'full_path="*{safe_path}*"' if safe_path else 'full_path="/*api/*"'
+    status_filter = f" status_code={status_code}" if status_code else ""
+    return (
+        f'index=k8s-customcheckout-prod store_id={store_id}'
+        f' method IN ({methods})'
+        f' {path_filter}'
+        f'{token_filter}'
+        f'{status_filter}'
+        f' earliest={earliest} latest={latest}\n'
+        '| eval request_started_at=(_time-\'request_duration\')\n'
+        '| eval request_started_at=strftime(request_started_at, "%Y-%m-%d %H:%M:%S.%Q")\n'
+        '| eval request_ended_at=strftime(_time, "%Y-%m-%d %H:%M:%S.%Q")\n'
+        '| sort 0 request_started_at\n'
+        f'| head {max_rows}\n'
+        '| table method full_path status_code request_started_at access_token_id request_duration'
+    )
+
+
+def fetch_error_patterns(
+    store_id: int,
+    time_value: int,
+    time_unit: str,
+    token_ids: Optional[list] = None,
+    status_codes: Optional[list] = None,
+) -> dict:
+    """Fetch non-success error breakdown from Splunk, grouped by token/method/path/status."""
+    query = build_error_patterns_spl(store_id, time_value, time_unit, token_ids, status_codes)
+    access_token, token_data = load_watchtower_token()
+    if not access_token:
+        return {"redirect": True, "rows": [], "total": 0}
+    try:
+        result = call_watchtower_splunk(query, access_token)
+        if result is None:
+            access_token = refresh_watchtower_token(token_data)
+            if not access_token:
+                return {"redirect": True, "rows": [], "total": 0}
+            result = call_watchtower_splunk(query, access_token)
+            if result is None:
+                return {"redirect": True, "rows": [], "total": 0}
+    except http_requests.exceptions.RequestException as e:
+        raise ValueError(f"Watchtower unreachable: {e}")
+
+    rows = []
+    for row in result.get("results", []):
+        tid = str(row.get("access_token_id", ""))
+        if not tid:
+            continue
+        try:
+            cnt = int(row.get("count", 0))
+        except (ValueError, TypeError):
+            cnt = 0
+        rows.append({
+            "token_id": tid,
+            "method": str(row.get("method", "")),
+            "path": str(row.get("full_path", "")),
+            "status_code": str(row.get("status_code", "")),
+            "count": cnt,
+        })
+    return {"redirect": False, "rows": rows, "total": sum(r["count"] for r in rows)}
+
+
+def fetch_token_activity(
+    store_id: int,
+    earliest: str,
+    latest: str = "now",
+    token_id: Optional[int] = None,
+    method: Optional[str] = None,
+    path_contains: Optional[str] = None,
+    status_code: Optional[str] = None,
+    max_rows: int = 100,
+) -> dict:
+    """Fetch raw (non-aggregated) request rows from Splunk for a specific time window."""
+    query = build_activity_spl(store_id, earliest, latest, token_id, method,
+                                path_contains, status_code, max_rows)
+    access_token, token_data = load_watchtower_token()
+    if not access_token:
+        return {"redirect": True, "rows": [], "total": 0}
+    try:
+        result = call_watchtower_splunk(query, access_token)
+        if result is None:
+            access_token = refresh_watchtower_token(token_data)
+            if not access_token:
+                return {"redirect": True, "rows": [], "total": 0}
+            result = call_watchtower_splunk(query, access_token)
+            if result is None:
+                return {"redirect": True, "rows": [], "total": 0}
+    except http_requests.exceptions.RequestException as e:
+        raise ValueError(f"Watchtower unreachable: {e}")
+
+    rows = []
+    for row in result.get("results", []):
+        tid = str(row.get("access_token_id", ""))
+        if not tid:
+            continue
+        rows.append({
+            "timestamp": str(row.get("request_started_at", "")),
+            "token_id": tid,
+            "method": str(row.get("method", "")),
+            "path": str(row.get("full_path", "")),
+            "status_code": str(row.get("status_code", "")),
+            "duration_ms": str(row.get("request_duration", "")),
+        })
+    return {"redirect": False, "rows": rows, "total": len(rows)}
+
+
 def window_seconds(time_value: int, time_unit: str) -> int:
     return time_value * _UNIT_SECONDS.get(time_unit, 60)

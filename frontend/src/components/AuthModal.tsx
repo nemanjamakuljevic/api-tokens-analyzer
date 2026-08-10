@@ -1,8 +1,19 @@
+type AuthMode = "api_key" | "claude_cli";
+
 interface AuthModalProps {
-  onSelect: (mode: "api_key" | "claude_cli") => void;
+  onSelect: (mode: AuthMode) => void;
+  lastUsed?: AuthMode | null;
 }
 
-export default function AuthModal({ onSelect }: AuthModalProps) {
+function LastUsedPill() {
+  return (
+    <span className="ml-2 shrink-0 text-[10px] font-medium px-1.5 py-0.5 rounded-full bg-gray-100 text-gray-500 border border-gray-200">
+      Last used
+    </span>
+  );
+}
+
+export default function AuthModal({ onSelect, lastUsed }: AuthModalProps) {
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-gradient-to-br from-slate-100 to-blue-50">
       <div className="bg-white rounded-2xl shadow-xl border border-gray-200 max-w-md w-full mx-4 overflow-hidden">
@@ -23,7 +34,10 @@ export default function AuthModal({ onSelect }: AuthModalProps) {
                 </svg>
               </div>
               <div className="min-w-0">
-                <div className="font-semibold text-gray-900 text-sm">Anthropic API Key</div>
+                <div className="flex items-center font-semibold text-gray-900 text-sm">
+                  Anthropic API Key
+                  {lastUsed === "api_key" && <LastUsedPill />}
+                </div>
                 <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">
                   Uses <code className="bg-gray-100 px-1 rounded text-gray-700">ANTHROPIC_API_KEY</code> from your backend <code className="bg-gray-100 px-1 rounded text-gray-700">.env</code>. Full streaming and extended thinking.
                 </p>
@@ -42,7 +56,10 @@ export default function AuthModal({ onSelect }: AuthModalProps) {
                 </svg>
               </div>
               <div className="min-w-0">
-                <div className="font-semibold text-gray-900 text-sm">Claude CLI Session</div>
+                <div className="flex items-center font-semibold text-gray-900 text-sm">
+                  Claude CLI Session
+                  {lastUsed === "claude_cli" && <LastUsedPill />}
+                </div>
                 <p className="text-xs text-gray-500 mt-0.5 leading-relaxed">
                   Uses your logged-in <code className="bg-gray-100 px-1 rounded text-gray-700">claude</code> CLI session — no API key needed. Requires Claude Code installed and <code className="bg-gray-100 px-1 rounded text-gray-700">claude login</code>.
                 </p>
@@ -53,7 +70,8 @@ export default function AuthModal({ onSelect }: AuthModalProps) {
 
         <div className="px-6 pb-5 text-center">
           <p className="text-[11px] text-gray-400">
-            Your choice is saved in this browser. You can reset it by clearing localStorage.
+            Asked every time you open the app. You can switch mid-session from the badge
+            in the top-right corner.
           </p>
         </div>
       </div>
